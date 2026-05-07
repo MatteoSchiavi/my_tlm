@@ -1,0 +1,30 @@
+# Core training dependencies
+torch>=2.2.0
+numpy>=1.24.0
+tokenizers>=0.15.0
+
+# 8-bit optimizer (saves ~50% optimizer memory)
+# Note: bitsandbytes may not work on Windows. Standard AdamW is used as fallback.
+bitsandbytes>=0.41.0
+
+# Data pipeline
+datasets>=2.14.0
+huggingface-hub>=0.19.0
+
+# Language detection (Bug 5 fix — accurate Italian filtering)
+langdetect>=1.0.9
+
+# System monitoring
+psutil>=5.9.0
+
+# Progress bars (used by datasets)
+tqdm>=4.65.0
+
+# Optional: experiment tracking
+# wandb>=0.15.0          # WandB logging (enable with WANDB=1 python train.py)
+
+# Optional: better optimizer
+# muon-pytorch>=0.1.0    # Muon optimizer (enable with MUON=1 python train.py)
+
+# Optional: torch.compile() acceleration (Linux only — not available on Windows)
+# triton>=2.1.0          # Required for torch.compile() with Inductor backend

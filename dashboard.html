@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SLM Training Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1117;
+    --card: #1a1d27;
+    --border: #2a2d3a;
+    --text: #e0e0e0;
+    --text-dim: #888;
+    --accent: #6366f1;
+    --accent2: #22d3ee;
+    --green: #4ade80;
+    --red: #f87171;
+    --orange: #fb923c;
+    --purple: #a78bfa;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+
+  /* Header */
+  .header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 0; border-bottom: 1px solid var(--border); margin-bottom: 20px;
+  }
+  .header h1 { font-size: 1.5rem; font-weight: 700; }
+  .header h1 span { color: var(--accent); }
+  .status-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 6px 14px; border-radius: 20px; font-size: 0.8rem; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .status-badge.training { background: rgba(99,102,241,0.2); color: var(--accent); }
+  .status-badge.paused { background: rgba(251,146,60,0.2); color: var(--orange); }
+  .status-badge.complete { background: rgba(74,222,128,0.2); color: var(--green); }
+  .status-badge.initializing { background: rgba(136,136,136,0.2); color: var(--text-dim); }
+  .status-badge.disconnected { background: rgba(248,113,113,0.2); color: var(--red); }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%; background: currentColor;
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  /* Connection banner */
+  .connection-banner {
+    background: rgba(248,113,113,0.15); border: 1px solid rgba(248,113,113,0.3);
+    border-radius: 12px; padding: 20px; margin-bottom: 20px; text-align: center;
+  }
+  .connection-banner h3 { color: var(--red); margin-bottom: 8px; }
+  .connection-banner p { color: var(--text-dim); font-size: 0.9rem; }
+  .connection-banner code {
+    background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px;
+    font-size: 0.85rem;
+  }
+
+  /* Stats Grid */
+  .stats-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px; margin-bottom: 20px;
+  }
+  .stat-card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px; transition: border-color 0.2s;
+  }
+  .stat-card:hover { border-color: var(--accent); }
+  .stat-label { font-size: 0.75rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+  .stat-value { font-size: 1.5rem; font-weight: 700; }
+  .stat-value.green { color: var(--green); }
+  .stat-value.accent { color: var(--accent); }
+  .stat-value.accent2 { color: var(--accent2); }
+  .stat-value.orange { color: var(--orange); }
+  .stat-value.purple { color: var(--purple); }
+
+  /* Charts */
+  .charts-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px;
+  }
+  .chart-card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px;
+  }
+  .chart-card h3 {
+    font-size: 0.85rem; color: var(--text-dim); text-transform: uppercase;
+    letter-spacing: 0.5px; margin-bottom: 12px;
+  }
+  .chart-container { position: relative; height: 250px; }
+
+  /* Progress bar */
+  .progress-section {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px; margin-bottom: 20px;
+  }
+  .progress-header { display: flex; justify-content: space-between; margin-bottom: 8px; }
+  .progress-label { font-size: 0.85rem; color: var(--text-dim); }
+  .progress-pct { font-size: 0.85rem; font-weight: 600; color: var(--accent); }
+  .progress-bar {
+    height: 8px; background: var(--border); border-radius: 4px; overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2));
+    border-radius: 4px; transition: width 0.5s ease;
+  }
+  .progress-details {
+    display: flex; gap: 24px; margin-top: 8px; font-size: 0.8rem; color: var(--text-dim);
+  }
+
+  /* GPU section */
+  .gpu-section {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px; margin-bottom: 20px;
+  }
+  .gpu-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .gpu-header h3 { font-size: 0.85rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
+  .gpu-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .gpu-bar-container { }
+  .gpu-bar-label { display: flex; justify-content: space-between; font-size: 0.8rem; margin-bottom: 4px; }
+  .gpu-bar { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+  .gpu-bar-fill { height: 100%; border-radius: 3px; transition: width 0.5s ease; }
+
+  /* Footer */
+  .footer { text-align: center; padding: 20px 0; font-size: 0.75rem; color: var(--text-dim); }
+
+  @media (max-width: 768px) {
+    .charts-grid { grid-template-columns: 1fr; }
+    .stats-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <!-- Header -->
+  <div class="header">
+    <h1><span>SLM</span> Training Monitor</h1>
+    <div id="statusBadge" class="status-badge disconnected">
+      <span class="status-dot"></span>
+      <span id="statusText">Connecting...</span>
+    </div>
+  </div>
+
+  <!-- Connection banner (shown when train.py is not running) -->
+  <div id="connectionBanner" class="connection-banner">
+    <h3>Waiting for training process</h3>
+    <p>The dashboard needs <code>python train.py</code> to be running.</p>
+    <p>Start training in another terminal, then this page will auto-connect.</p>
+    <p style="margin-top: 8px; font-size: 0.8rem;">Attempting to connect every 3 seconds...</p>
+  </div>
+
+  <!-- Progress -->
+  <div class="progress-section" id="mainContent" style="display:none;">
+    <div class="progress-header">
+      <span class="progress-label">Training Progress</span>
+      <span class="progress-pct" id="progressPct">0%</span>
+    </div>
+    <div class="progress-bar">
+      <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+    </div>
+    <div class="progress-details">
+      <span>Step: <strong id="currentStep">0</strong> / <span id="maxSteps">60000</span></span>
+      <span>Tokens: <strong id="totalTokens">0</strong></span>
+      <span>ETA: <strong id="etaHours">--</strong></span>
+      <span>Speed: <strong id="tokPerSec">0</strong> tok/s</span>
+      <span>Epoch: <strong id="dataEpoch">1</strong></span>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats-grid" id="statsGrid" style="display:none;">
+    <div class="stat-card">
+      <div class="stat-label">Training Loss</div>
+      <div class="stat-value accent" id="trainLoss">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Validation Loss</div>
+      <div class="stat-value accent2" id="valLoss">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Val Perplexity</div>
+      <div class="stat-value orange" id="valPpl">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Learning Rate</div>
+      <div class="stat-value green" id="lr">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Best Val Loss</div>
+      <div class="stat-value" id="bestVal">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Grad Norm</div>
+      <div class="stat-value purple" id="gradNorm">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Batch Tokens</div>
+      <div class="stat-value" id="batchTokens">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Model Size</div>
+      <div class="stat-value" id="modelSize">212M</div>
+    </div>
+  </div>
+
+  <!-- GPU Stats -->
+  <div class="gpu-section" id="gpuSection" style="display:none;">
+    <div class="gpu-header">
+      <h3>GPU Resources</h3>
+      <span style="font-size: 0.8rem; color: var(--text-dim);" id="gpuLabel">NVIDIA GPU</span>
+    </div>
+    <div class="gpu-grid">
+      <div class="gpu-bar-container">
+        <div class="gpu-bar-label">
+          <span>VRAM Usage</span>
+          <span id="vramText">-- / -- MB</span>
+        </div>
+        <div class="gpu-bar">
+          <div class="gpu-bar-fill" id="vramFill" style="width: 0%; background: var(--accent);"></div>
+        </div>
+      </div>
+      <div class="gpu-bar-container">
+        <div class="gpu-bar-label">
+          <span>GPU Utilisation</span>
+          <span id="gpuUtilText">-- %</span>
+        </div>
+        <div class="gpu-bar">
+          <div class="gpu-bar-fill" id="gpuUtilFill" style="width: 0%; background: var(--green);"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Charts -->
+  <div class="charts-grid" id="chartsGrid" style="display:none;">
+    <div class="chart-card">
+      <h3>Training Loss</h3>
+      <div class="chart-container">
+        <canvas id="lossChart"></canvas>
+      </div>
+    </div>
+    <div class="chart-card">
+      <h3>Validation Loss</h3>
+      <div class="chart-container">
+        <canvas id="valChart"></canvas>
+      </div>
+    </div>
+    <div class="chart-card">
+      <h3>Learning Rate Schedule</h3>
+      <div class="chart-container">
+        <canvas id="lrChart"></canvas>
+      </div>
+    </div>
+    <div class="chart-card">
+      <h3>Throughput (tok/s)</h3>
+      <div class="chart-container">
+        <canvas id="speedChart"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    SLM Training Dashboard v3.2 — Italian + C Optimised Small Language Model
+  </div>
+</div>
+
+<script>
+// ─── Chart Setup ──────────────────────────────────────────────────────────────
+
+const chartDefaults = {
+  responsive: true,
+  maintainAspectRatio: false,
+  animation: { duration: 300 },
+  plugins: {
+    legend: { display: false },
+    tooltip: {
+      backgroundColor: '#1a1d27',
+      borderColor: '#2a2d3a',
+      borderWidth: 1,
+      titleColor: '#e0e0e0',
+      bodyColor: '#e0e0e0',
+    }
+  },
+  scales: {
+    x: {
+      grid: { color: 'rgba(42,45,58,0.5)' },
+      ticks: { color: '#888', maxTicksLimit: 8 }
+    },
+    y: {
+      grid: { color: 'rgba(42,45,58,0.5)' },
+      ticks: { color: '#888' }
+    }
+  }
+};
+
+function createChart(ctx, label, color) {
+  return new Chart(ctx, {
+    type: 'line',
+    data: {
+      datasets: [{
+        label: label,
+        data: [],
+        borderColor: color,
+        backgroundColor: color + '20',
+        fill: true,
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.3,
+      }]
+    },
+    options: {
+      ...chartDefaults,
+      scales: {
+        ...chartDefaults.scales,
+        x: { ...chartDefaults.scales.x, type: 'linear' }
+      }
+    }
+  });
+}
+
+const lossChart = createChart(
+  document.getElementById('lossChart').getContext('2d'), 'Train Loss', '#6366f1'
+);
+const valChart = createChart(
+  document.getElementById('valChart').getContext('2d'), 'Val Loss', '#22d3ee'
+);
+const lrChart = createChart(
+  document.getElementById('lrChart').getContext('2d'), 'LR', '#4ade80'
+);
+const speedChart = createChart(
+  document.getElementById('speedChart').getContext('2d'), 'tok/s', '#fb923c'
+);
+
+// ─── Connection State ─────────────────────────────────────────────────────────
+
+let connected = false;
+let failCount = 0;
+
+function showConnected() {
+  connected = true;
+  failCount = 0;
+  document.getElementById('connectionBanner').style.display = 'none';
+  document.getElementById('mainContent').style.display = '';
+  document.getElementById('statsGrid').style.display = '';
+  document.getElementById('gpuSection').style.display = '';
+  document.getElementById('chartsGrid').style.display = '';
+}
+
+function showDisconnected() {
+  connected = false;
+  failCount++;
+  document.getElementById('connectionBanner').style.display = '';
+  document.getElementById('statusBadge').className = 'status-badge disconnected';
+  document.getElementById('statusText').textContent = 'Disconnected';
+  // Don't hide the main content if we had data before — keep showing last state
+  // But if we never connected, keep it hidden
+  if (failCount <= 2) {
+    document.getElementById('mainContent').style.display = 'none';
+    document.getElementById('statsGrid').style.display = 'none';
+    document.getElementById('gpuSection').style.display = 'none';
+    document.getElementById('chartsGrid').style.display = 'none';
+  }
+}
+
+// ─── Data Fetching ────────────────────────────────────────────────────────────
+
+function formatNumber(n) {
+  if (n >= 1e9) return (n/1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n/1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
+  return n.toString();
+}
+
+function updateChart(chart, history) {
+  if (!history || history.length === 0) return;
+  chart.data.datasets[0].data = history.map(p => ({ x: p.step, y: p.value }));
+  chart.update('none');
+}
+
+async function refresh() {
+  try {
+    const resp = await fetch('/api/metrics');
+    if (!resp.ok) throw new Error('Server returned ' + resp.status);
+    const data = await resp.json();
+
+    // First successful connect — show the dashboard
+    if (!connected) showConnected();
+
+    // Status
+    const badge = document.getElementById('statusBadge');
+    badge.className = 'status-badge ' + (data.status || 'initializing');
+    document.getElementById('statusText').textContent =
+      (data.status || 'initializing').charAt(0).toUpperCase() + (data.status || 'initializing').slice(1);
+
+    // Progress
+    const pct = data.max_steps > 0 ? (data.step / data.max_steps * 100) : 0;
+    document.getElementById('progressPct').textContent = pct.toFixed(1) + '%';
+    document.getElementById('progressFill').style.width = pct + '%';
+    document.getElementById('currentStep').textContent = data.step.toLocaleString();
+    document.getElementById('maxSteps').textContent = (data.max_steps || 60000).toLocaleString();
+    document.getElementById('totalTokens').textContent = formatNumber(data.total_tokens || 0);
+    document.getElementById('etaHours').textContent =
+      data.eta_hours > 0 ? data.eta_hours.toFixed(1) + 'h' : '--';
+    document.getElementById('tokPerSec').textContent = Math.round(data.tok_per_sec || 0).toLocaleString();
+    document.getElementById('dataEpoch').textContent = data.data_epoch || 1;
+
+    // Stats
+    document.getElementById('trainLoss').textContent =
+      (data.loss != null && data.loss > 0) ? data.loss.toFixed(4) : '--';
+    document.getElementById('valLoss').textContent =
+      (data.val_loss != null && data.val_loss > 0) ? data.val_loss.toFixed(4) : '--';
+    document.getElementById('valPpl').textContent =
+      (data.val_ppl != null && data.val_ppl > 0) ? data.val_ppl.toFixed(2) : '--';
+    document.getElementById('lr').textContent =
+      (data.lr != null && data.lr > 0) ? data.lr.toExponential(2) : '--';
+    document.getElementById('bestVal').textContent =
+      (data.best_val != null && data.best_val < 1e9) ? data.best_val.toFixed(4) : '--';
+    document.getElementById('gradNorm').textContent =
+      (data.grad_norm != null && data.grad_norm > 0) ? data.grad_norm.toFixed(2) : '--';
+    document.getElementById('batchTokens').textContent =
+      data.effective_batch_tokens ? formatNumber(data.effective_batch_tokens) : '--';
+
+    // GPU
+    const vramPct = data.gpu_mem_total_mb > 0
+      ? (data.gpu_mem_used_mb / data.gpu_mem_total_mb * 100) : 0;
+    document.getElementById('vramText').textContent =
+      `${(data.gpu_mem_used_mb||0).toLocaleString()} / ${(data.gpu_mem_total_mb||0).toLocaleString()} MB`;
+    document.getElementById('vramFill').style.width = vramPct + '%';
+    document.getElementById('vramFill').style.background =
+      vramPct > 90 ? '#f87171' : vramPct > 75 ? '#fb923c' : '#6366f1';
+
+    const utilPct = data.gpu_util_pct || 0;
+    document.getElementById('gpuUtilText').textContent = utilPct + '%';
+    document.getElementById('gpuUtilFill').style.width = utilPct + '%';
+    document.getElementById('gpuUtilFill').style.background =
+      utilPct < 50 ? '#fb923c' : '#4ade80';
+
+    // Charts
+    updateChart(lossChart, data.loss_history);
+    updateChart(valChart, data.val_history);
+    updateChart(lrChart, data.lr_history);
+    updateChart(speedChart, data.speed_history);
+
+  } catch (e) {
+    showDisconnected();
+    console.log('Waiting for training process... (', e.message, ')');
+  }
+}
+
+// Refresh every 3 seconds
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

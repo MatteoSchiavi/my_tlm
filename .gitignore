@@ -1,0 +1,15 @@
+.venv/
+venv/
+ENV/
+openwebtext/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+data_raw/
+.env
+data/
+data_filtered/
+data_mixed/
+checkpoints/
+tokenizer.json
