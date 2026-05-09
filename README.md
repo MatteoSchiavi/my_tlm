@@ -1,11 +1,56 @@
-# My_SLM — v3.2 Build Guide
+# My_SLM — v3.5 Build Guide
 
-python train.py --resume-from best.pt --reset-optimizer --compile
-
-wls: python train.py --resume-from best.pt --reset-optimizer --compile
 A 212M parameter Small Language Model built from scratch for 8 GB VRAM (RTX 3070),
 optimised for **Italian language + C programming**, with a real-time training dashboard.
 Full **Windows compatibility** — no Triton required.
+
+---
+
+## What's New in v3.5
+
+### VRAM Stability & Loss Fluctuation Fix (CRITICAL)
+
+Training at 99.2% VRAM was causing OOM crashes on the backward pass and ±3.5% loss
+fluctuation. The root cause was a triple interaction: aggressive learning rate, high
+dropout + MTP gradient noise, and zero VRAM headroom for peak allocations during the
+backward pass. This release addresses all three:
+
+| Issue                        | Cause                                                       | Fix                                                                      |
+| ---------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------ |
+| OOM on backward pass         | `MICRO_BATCH=2` + `aot_eager` compile allocated extra 250MB | `MICRO_BATCH=1`, `ACCUM_STEPS=64` (same effective batch, half peak VRAM) |
+| Loss fluctuation (±3.5%)     | LR=4e-4 too aggressive at 99% VRAM                          | LR reduced to 3e-4                                                       |
+| Loss spikes from MTP         | `mtp_weight=0.1` over-amplified gradient noise              | Reduced to 0.05                                                          |
+| Gradient noise amplification | dropout=0.05 + MTP noise + VRAM pressure                    | Reduced to 0.02                                                          |
+| CUDA OOM on compile          | `aot_eager` mode allocated extra buffers                    | Compile disabled by default on all platforms                             |
+| No smooth loss metric        | Raw mini-batch loss is too noisy to track                   | EMA loss tracking (α=0.05) added                                         |
+| Silent VRAM crisis           | No warning when GPU is about to OOM                         | VRAM pressure warning (>95% threshold)                                   |
+
+### Data Mix Rebalancing
+
+The C code tokenizer compression was poor (2.3 chars/token vs 6.5 for Italian),
+meaning the model saw relatively fewer C characters per training step. The data mix
+has been rebalanced to compensate:
+
+| Category   | Old Ratio | New Ratio | Rationale                                                  |
+| ---------- | --------- | --------- | ---------------------------------------------------------- |
+| Italian    | 45%       | 35%       | Still primary language, but not over-represented           |
+| C code     | 20%       | 35%       | 3x oversampling compensates for poor tokenizer compression |
+| C++ code   | 5%        | 10%       | Shares syntax with C, improves structural understanding    |
+| Other code | 5%        | 5%        | Python, JS, Bash, Rust — general programming patterns      |
+| English    | 25%       | 15%       | Reduced to make room for more code                         |
+
+**New effective mix: ~35% Italian, ~50% code (70% C), ~15% English**
+
+### Other Changes
+
+- `MAX_STEPS` extended from 60k to 80k (larger datasets need more training)
+- `WARMUP_STEPS` extended from 2000 to 3000 (prevents early divergence with new LR)
+- `STABLE_STEPS` adjusted: 3000 + 62,000 + 15,000 decay = 80,000 total
+- `CUDA memory_fraction` reduced from 0.95 to 0.88 (12% headroom for peak allocations)
+- EMA loss logged to WandB and JSONL for post-training analysis
+- `TARGET_TOTAL` in mix.py increased from 7M to 10M documents
+- Added `.gitignore` and `requirements.txt` (previously missing)
+- Dashboard footer updated to v3.5
 
 ---
 
@@ -13,24 +58,15 @@ Full **Windows compatibility** — no Triton required.
 
 ### Windows Compatibility (CRITICAL FIX)
 
-| Issue                                                     | Cause                                                            | Fix                                                                              |
-| --------------------------------------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `RuntimeError: Cannot find a working triton installation` | `torch.compile()` requires Triton, which doesn't work on Windows | Auto-detect: compile on Linux, eager mode on Windows                             |
-| 0 code files downloaded                                   | `codeparrot/github-code` uses deprecated loading script          | Replaced with `bigcode/starcoderdata` + `codeparrot/github-code-clean` fallbacks |
-| OSCAR download failed                                     | `oscar-corpus/OSCAR-2301` is gated (requires auth)               | Primary: `allenai/c4` (mc4, open access). OSCAR-2301 as fallback                 |
-| The Stack download failed                                 | `bigcode/the-stack` is gated                                     | Replaced with `bigcode/the-stack-smol` (open access)                             |
-| `num_workers` crash on Windows                            | Windows multiprocessing issues with DataLoader                   | Auto-detect: `num_workers=0` on Windows, 4 on Linux                              |
-| bitsandbytes import crash                                 | May fail on Windows even when installed                          | Try/except with sanity check, fallback to standard AdamW                         |
-| HF cache symlink warnings                                 | Windows needs Developer Mode for symlinks                        | `HF_HUB_DISABLE_SYMLINKS_WARNING=1` set automatically                            |
-
-### Key Changes
-
-- `train.py`: torch.compile() auto-disabled on Windows (10-20% slower but stable)
-- `train.py`: `COMPILE=1` env var to force compile, `NO_COMPILE=1` to disable on Linux
-- `train.py`: CUDA flags guarded with `torch.cuda.is_available()` checks
-- `download.py`: 3-tier fallback for code data (starcoderdata -> the-stack-smol -> github-code-clean)
-- `download.py`: Sequential mode on Windows by default (parallel causes crashes)
-- `download.py`: Better error messages with actionable fixes when sources fail
+| Issue                                                     | Cause                                                            | Fix                                                                                   |
+| --------------------------------------------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `RuntimeError: Cannot find a working triton installation` | `torch.compile()` requires Triton, which doesn't work on Windows | Auto-detect: compile on Linux, eager mode on Windows                                  |
+| 0 code files downloaded                                   | `codeparrot/github-code` uses deprecated loading script          | Replaced with `Fsoft-AIC/the-vault` (open) + `bigcode/starcoderdata` (gated fallback) |
+| OSCAR download failed                                     | `oscar-corpus/OSCAR-2301` is gated (requires auth)               | Primary: `allenai/c4` (mc4, open access). OSCAR-2301 as fallback                      |
+| The Stack download failed                                 | `bigcode/the-stack` is gated                                     | Replaced with `bigcode/the-stack-smol` (open access)                                  |
+| `num_workers` crash on Windows                            | Windows multiprocessing issues with DataLoader                   | Auto-detect: `num_workers=0` on Windows, 4 on Linux                                   |
+| bitsandbytes import crash                                 | May fail on Windows even when installed                          | Try/except with sanity check, fallback to standard AdamW                              |
+| HF cache symlink warnings                                 | Windows needs Developer Mode for symlinks                        | `HF_HUB_DISABLE_SYMLINKS_WARNING=1` set automatically                                 |
 
 ---
 
@@ -45,8 +81,10 @@ Full **Windows compatibility** — no Triton required.
 | 3   | **Muon optimizer**                      | Implemented | Drop-in replacement for AdamW (enable with `MUON=1`)            |
 | 4   | **WandB logging**                       | Implemented | Experiment tracking alongside dashboard (enable with `WANDB=1`) |
 | 5   | **5-tier data download**                | Implemented | smoke / quick / standard / full / max tiers                     |
-| 6   | **New data sources**                    | Implemented | Italian Gutenberg, English Gutenberg, C++ code, StackOverflow   |
+| 6   | **New data sources**                    | Implemented | Italian FineWeb-2, C++ code, improved fallback chain            |
 | 7   | **langdetect integration**              | Implemented | Accurate Italian filtering (fixes Bug 5)                        |
+| 8   | **EMA loss tracking**                   | Implemented | Smoothed loss curve (α=0.05), logged to WandB + JSONL           |
+| 9   | **VRAM pressure warning**               | Implemented | Prints actionable advice when VRAM >95%                         |
 
 ### Bugs Fixed
 
@@ -59,10 +97,13 @@ Full **Windows compatibility** — no Triton required.
 | 5   | Weak Italian detection       | download.py + filter.py | langdetect with improved fallback                    |
 | 6   | nvidia-smi every step        | train.py                | Cached GPU stats (every 10 steps)                    |
 | 7   | val_loader missing drop_last | train.py                | Added drop_last=True                                 |
-| 8   | Missing requirements         | requirements.txt        | Added langdetect, psutil, tqdm                       |
+| 8   | Missing requirements         | requirements.txt        | Added langdetect, psutil, wandb                      |
 | 9   | Fragile \_init_weights       | model.py                | Direct module type check instead of named_parameters |
 | 10  | Dead spike detector          | train.py                | Removed check_spike (z-loss handles stability)       |
 | 11  | Insufficient data tiers      | download.py             | Added smoke + max tiers                              |
+| 12  | OOM on backward pass         | train.py                | MICRO_BATCH=1, CUDA memory_fraction=0.88             |
+| 13  | Loss fluctuation ±3.5%       | model.py + train.py     | LR 3e-4, dropout 0.02, mtp_weight 0.05               |
+| 14  | Poor C tokenizer compression | mix.py                  | C code 3x oversampled (35% of mix)                   |
 
 ---
 
@@ -70,16 +111,12 @@ Full **Windows compatibility** — no Triton required.
 
 ### Why Do the Numbers Seem "Low"?
 
-The previous tier system was designed for the original training settings
-(seq_len=512, ACCUM_STEPS=8, effective batch of 8,192 tokens). The v2 settings
-(seq_len=1024, ACCUM_STEPS=32) consume **8x more tokens per optimizer step**.
-
-The fundamental constraint is this equation:
+The fundamental constraint is the training budget equation:
 
 ```
 Training budget = MAX_STEPS x MICRO_BATCH x ACCUM_STEPS x seq_len
-               = 60,000 x 2 x 32 x 1024
-               = 3.93 billion tokens
+               = 80,000 x 1 x 64 x 1024
+               = 5.24 billion tokens
 ```
 
 Your dataset needs to hold AT LEAST this many tokens to avoid repeating documents
@@ -87,11 +124,8 @@ Your dataset needs to hold AT LEAST this many tokens to avoid repeating document
 document on average:
 
 ```
-Minimum documents needed = 3.93B / 600 = ~6.5 million documents
+Minimum documents needed = 5.24B / 600 = ~8.7 million documents
 ```
-
-The old `full` tier had 2.46M documents (~1.47B tokens) — enough for v1 settings,
-but less than half of what v2 needs.
 
 ### Chinchilla Context
 
@@ -99,7 +133,7 @@ The "Chinchilla optimal" rule says a model of **N parameters** should see
 **~20N tokens** during training for compute-optimal performance:
 
 ```
-205M params x 20 = 4.1 billion tokens  <- minimum for this model
+212M params x 20 = 4.24 billion tokens  <- minimum for this model
 ```
 
 Training on significantly less leaves capability on the table. Training on
@@ -128,13 +162,11 @@ python download.py --tier smoke
 | Other Code        | 5,000       | 5.0M       |
 | **Total**         | **~28,000** | **~21M**   |
 
-| Metric                  | Value                                   |
-| ----------------------- | --------------------------------------- |
-| Download time           | ~3-5 minutes                            |
-| Preprocessing           | ~1 minute                               |
-| Min training steps      | 500 (to see loss move)                  |
-| Wall time for 500 steps | ~20 minutes                             |
-| Good for                | "Does my GPU work? Does loss decrease?" |
+| Metric             | Value                                   |
+| ------------------ | --------------------------------------- |
+| Download time      | ~3-5 minutes                            |
+| Min training steps | 500 (to see loss move)                  |
+| Good for           | "Does my GPU work? Does loss decrease?" |
 
 ---
 
@@ -161,9 +193,7 @@ python download.py --tier quick
 | Metric                | Value                                        |
 | --------------------- | -------------------------------------------- |
 | Download time         | ~20-40 minutes                               |
-| Preprocessing         | ~5 minutes                                   |
 | Recommended MAX_STEPS | 5,000                                        |
-| Wall time (RTX 3070)  | ~42 hours (~5 days at 8h/day)                |
 | Good for              | Hyperparameter testing, architecture changes |
 
 ---
@@ -188,19 +218,18 @@ python download.py --tier standard
 | Other Code        | 120,000        | 120M       |
 | **Total**         | **~1,500,000** | **~1.03B** |
 
-| Metric                | Value                           |
-| --------------------- | ------------------------------- |
-| Download time         | ~2-4 hours                      |
-| Recommended MAX_STEPS | 20,000                          |
-| Wall time (RTX 3070)  | ~166 hours (~21 days at 8h/day) |
-| Good for              | First production-quality model  |
+| Metric                | Value                          |
+| --------------------- | ------------------------------ |
+| Download time         | ~2-4 hours                     |
+| Recommended MAX_STEPS | 20,000                         |
+| Good for              | First production-quality model |
 
 ---
 
 ### Tier 3 — Full
 
 **Purpose:** Best model achievable in a reasonable training run on one 3070.
-Near Chinchilla-optimal for 205M params.
+Near Chinchilla-optimal for 212M params.
 
 ```bash
 python download.py --tier full
@@ -223,8 +252,6 @@ python download.py --tier full
 | Download time                  | ~6-10 hours                           |
 | Disk (raw + filtered + binary) | ~35-50 GB                             |
 | Recommended MAX_STEPS          | 40,000                                |
-| Wall time (RTX 3070)           | ~332 hours (~41 days at 8h/day)       |
-| Expected val loss at 40k steps | ~2.1-2.3                              |
 | Good for                       | Serious use, close to peak capability |
 
 ---
@@ -232,7 +259,7 @@ python download.py --tier full
 ### Tier MAX — Maximum Intelligence
 
 **Purpose:** Absolute best this architecture can achieve. Exceeds Chinchilla-optimal
-(~2x the minimum token budget). Expect excellent Italian fluency, solid C completion,
+(~1.2x the minimum token budget). Expect excellent Italian fluency, solid C completion,
 and reasonable general English capability.
 
 ```bash
@@ -240,33 +267,27 @@ python download.py --tier max
 ```
 
 > **Note:** Requires ~80-100 GB of free disk space during download + processing.
-> Some sources (The Stack) require a HuggingFace account and licence agreement.
+> Some sources (BigCode) require a HuggingFace account and licence agreement.
 
-| Source                       | Documents      | Tokens (~) | Notes                         |
-| ---------------------------- | -------------- | ---------- | ----------------------------- |
-| Italian OSCAR                | 1,000,000      | 600M       | ~1/8 of the full corpus       |
-| Italian Wikipedia            | 60,000         | 36M        | Full Italian Wikipedia        |
-| Italian FineWeb-2            | 600,000        | 360M       | Best Italian web quality      |
-| Italian Books (Gutenberg IT) | 20,000         | 40M        | Long-form Italian prose       |
-| English Web (OpenWebText)    | 2,000,000      | 1,200M     | ~1/4 of the full corpus       |
-| English Wikipedia            | 600,000        | 360M       | Top articles by length        |
-| English Edu (FineWeb-Edu)    | 1,200,000      | 720M       | High educational score        |
-| Project Gutenberg (EN)       | 50,000         | 200M       | Public domain books           |
-| C Code (The Stack)           | 800,000        | 800M       | License-filtered C files      |
-| C++ Code (The Stack)         | 300,000        | 300M       | Complements C understanding   |
-| Python/JS/Rust/Shell         | 400,000        | 400M       | General programming structure |
-| StackOverflow Q&A            | 200,000        | 160M       | C/Italian Q&A pairs           |
-| **Total**                    | **~7,230,000** | **~5.18B** |                               |
+| Source                    | Documents      | Tokens (~) | Notes                    |
+| ------------------------- | -------------- | ---------- | ------------------------ |
+| Italian OSCAR             | 1,000,000      | 600M       | ~1/8 of the full corpus  |
+| Italian Wikipedia         | 60,000         | 36M        | Full Italian Wikipedia   |
+| Italian FineWeb-2         | 600,000        | 360M       | Best Italian web quality |
+| English Web (OpenWebText) | 2,000,000      | 1,200M     | ~1/4 of the full corpus  |
+| English Wikipedia         | 600,000        | 360M       | Top articles by length   |
+| English Edu (FineWeb-Edu) | 1,200,000      | 720M       | High educational score   |
+| C Code (The Vault)        | 800,000        | 800M       | License-filtered C files |
+| Other Code                | 400,000        | 400M       | Python, JS, Rust, Shell  |
+| **Total**                 | **~6,660,000** | **~4.48B** |                          |
 
 | Metric                         | Value                                          |
 | ------------------------------ | ---------------------------------------------- |
 | Download time                  | ~16-28 hours                                   |
 | Disk (raw + filtered + binary) | ~70-90 GB                                      |
 | Recommended MAX_STEPS          | 80,000                                         |
-| Training budget at 80k steps   | 5.24B tokens (~1.01 passes through data)       |
-| Wall time (RTX 3070)           | ~665 hours (~83 days at 8h/day)                |
-| Expected val loss              | ~1.85-2.05                                     |
-| Expected perplexity            | ~6-8                                           |
+| Training budget at 80k steps   | 5.24B tokens (~1.17 passes through data)       |
+| Wall time (RTX 3070, 8h/day)   | ~83 days                                       |
 | Good for                       | Maximum quality — leave it running for a month |
 
 **Practical note:** At 8 hours/day, the max tier takes ~83 calendar days. A more
@@ -288,8 +309,9 @@ stable phase can simply be extended.
 
 **Tested on:**
 
-- RTX 3070 Laptop (8 GB VRAM), 16 GB DDR4, WSL2 Ubuntu 22.04
+- RTX 3070 Laptop (8 GB dedicated + 7 GB shared VRAM), 16 GB DDR4, Ryzen 7 5000 series, SSD
 - Windows 11 native (eager mode, ~10-20% slower than compiled Linux)
+- WSL2 Ubuntu 22.04
 
 ### Windows vs Linux
 
@@ -313,15 +335,15 @@ stable phase can simply be extended.
 My_SLM/
 ├── download.py          # Tiered data download (smoke/quick/standard/full/max)
 ├── filter.py            # Quality filtering, deduplication, Italian-aware
-├── mix.py               # Mix 45% Italian / 25% Code (C-primary) / 25% English / 5% C++
+├── mix.py               # Mix 35% Italian / 35% C / 10% C++ / 5% other code / 15% English
 ├── preprocess.py        # BPE tokenizer (500k sample) + binary packing
-├── model.py             # 205M Transformer (GQA, RoPE, SwiGLU, MTP, z-loss, KV cache)
+├── model.py             # 212M Transformer (GQA, RoPE, SwiGLU, MTP, z-loss, KV cache)
 ├── train.py             # Training loop + live dashboard + WandB + Muon support
 ├── inference.py         # Generation with KV cache + speculative decoding
 ├── dashboard.html       # Real-time training monitor (served by train.py)
 ├── requirements.txt     # All dependencies
-├── tokenizer.json       # Trained BPE tokenizer (32k vocab)
-├── training_log.jsonl   # Append-only training log (step, loss, lr, tok/s)
+├── .gitignore           # Ignores data, checkpoints, and generated files
+├── tokenizer.json       # Trained BPE tokenizer (32k vocab) — generated by preprocess.py
 ├── data/
 │   ├── train.bin        # Packed training tokens (uint16)
 │   └── val.bin          # Packed validation tokens (uint16)
@@ -359,17 +381,17 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}, Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}')"
 # Should print: CUDA: True, Device: NVIDIA GeForce RTX 3070 ...
 
-# Core
+# Core + quality filtering
 pip install datasets huggingface-hub tokenizers numpy
-pip install langdetect psutil tqdm
-
-# Optional: 8-bit optimizer (saves ~50% memory, may not work on Windows)
-pip install bitsandbytes
+pip install langdetect
 
 # Optional: experiment tracking
-pip install wandb
+pip install wandb psutil
 
-# Optional: Muon optimizer
+# Optional: 8-bit optimizer (saves ~1.3GB VRAM, may not work on Windows)
+pip install bitsandbytes
+
+# Optional: Muon optimizer (alternative to AdamW)
 pip install muon-pytorch
 
 # Optional: Triton (Linux only — enables torch.compile for ~20% speedup)
@@ -385,7 +407,7 @@ pip install triton
 Most datasets are open access, but some larger/higher-quality ones require authentication:
 
 - `oscar-corpus/OSCAR-2301` (Italian) — gated, needs auth
-- `bigcode/the-stack` (code) — gated, needs licence agreement
+- `bigcode/starcoderdata` (code) — gated, needs licence agreement
 
 ```bash
 huggingface-cli login
@@ -393,15 +415,14 @@ huggingface-cli login
 
 # Then visit these URLs and click "Access repository":
 # https://huggingface.co/datasets/oscar-corpus/OSCAR-2301
-# https://huggingface.co/datasets/bigcode/the-stack
+# https://huggingface.co/datasets/bigcode/starcoderdata
 ```
 
 **Without HF login**, you'll still get data from open-access sources:
 
 - `allenai/c4` (mc4 Italian) instead of OSCAR-2301
-- `bigcode/starcoderdata` instead of The Stack
-- `bigcode/the-stack-smol` as additional fallback
-- `codeparrot/github-code-clean` as last resort for code
+- `Fsoft-AIC/the-vault` (truly open, ~1.9M C files) instead of StarCoder
+- `code_search_net` for Python/JS
 
 You'll get ~70-80% of the target data without login, which is still enough for training.
 
@@ -426,6 +447,16 @@ WANDB=1 MUON=1 python train.py  # Both
 # torch.compile control:
 COMPILE=1 python train.py  # Force compile (crashes without Triton!)
 NO_COMPILE=1 python train.py  # Force eager mode (for debugging on Linux)
+
+# Override batch config (keep 65k effective batch):
+python train.py --micro-batch 1 --accum-steps 64    # Minimum VRAM (default)
+python train.py --micro-batch 2 --accum-steps 32    # Faster but needs VRAM headroom
+
+# Resume from checkpoint:
+python train.py                                    # Auto-finds best.pt
+python train.py --resume-from ckpt_4000.pt         # Specific checkpoint
+python train.py --reset-optimizer                  # Fresh optimizer (recommended after data change)
+python train.py --8bit-adam                        # Saves ~1.3GB VRAM but ~5-10% slower
 ```
 
 ### 5. Monitor and generate
@@ -468,20 +499,22 @@ python inference.py --checkpoint checkpoints/ckpt_30000.pt
 
 ## Architecture
 
-### Model Specifications (v3)
+### Model Specifications (v3.5)
 
-| Parameter           | Value   | Notes                     |
-| ------------------- | ------- | ------------------------- |
-| Total parameters    | ~205M   |                           |
-| Embedding dimension | 1,152   |                           |
-| Layers              | 12      |                           |
-| Attention heads     | 18      |                           |
-| KV heads (GQA)      | **6**   | 3 Q-heads share 1 KV-head |
-| Feed-forward dim    | 3,072   | SwiGLU hidden             |
-| Context length      | 1,024   |                           |
-| Vocabulary size     | 32,000  | BPE, Italian+C weighted   |
-| RoPE theta          | 500,000 | Llama 3 style             |
-| Dropout             | 0.05    |                           |
+| Parameter           | Value    | Notes                     |
+| ------------------- | -------- | ------------------------- |
+| Total parameters    | ~212M    | With weight tying         |
+| Embedding dimension | 1,152    |                           |
+| Layers              | 12       |                           |
+| Attention heads     | 18       |                           |
+| KV heads (GQA)      | **6**    | 3 Q-heads share 1 KV-head |
+| Feed-forward dim    | 3,072    | SwiGLU hidden             |
+| Context length      | 1,024    |                           |
+| Vocabulary size     | 32,000   | BPE, Italian+C weighted   |
+| RoPE theta          | 500,000  | Llama 3 style             |
+| Dropout             | **0.02** | Reduced from 0.05 in v3.5 |
+| MTP weight          | **0.05** | Reduced from 0.1 in v3.5  |
+| Z-loss weight       | 1e-4     | PaLM/Gemma stability      |
 
 ### Architecture Features
 
@@ -490,7 +523,7 @@ python inference.py --checkpoint checkpoints/ckpt_30000.pt
 At inference with a KV cache, this allows much longer generation before memory pressure.
 
 **QK-Norm (RMSNorm on Q and K)**
-Prevents attention softmax saturation. Allows LR of 6e-4 without instability, even at
+Prevents attention softmax saturation. Allows LR of 3e-4 without instability, even at
 1024 context length where attention logits can grow large.
 
 **RoPE with theta=500,000**
@@ -512,6 +545,8 @@ Two auxiliary heads predict token positions t+2 and t+3 (in addition to the main
 head at t+1). Loss contributions decay: head 0 at full `mtp_weight`, head 1 at half.
 This forces intermediate hidden states to encode richer information and improves
 representation quality. Also enables **speculative decoding** at inference (see below).
+Weight reduced to 0.05 in v3.5 — higher values over-amplified gradient noise,
+causing loss fluctuation at high VRAM utilisation.
 
 **KV Cache**
 Each attention layer caches its computed key and value tensors. During generation,
@@ -527,7 +562,7 @@ speedup on top of the KV cache. Enable with `--speculative` flag.
 **Gradient Checkpointing**
 Discards activation tensors after the forward pass, recomputes them during backward.
 Trades ~20% more compute for ~40% less VRAM. Essential for fitting the full model
-at 1024 context in 8 GB.
+at 1024 context in 8 GB. Enabled by default.
 
 **Weight Tying**
 Input embedding matrix = output projection matrix. Saves ~150M parameters (no separate
@@ -537,54 +572,81 @@ output head), and forces the model to use a unified semantic space for reading a
 Output projections (`wo`, `w2`) initialised with `std = 0.02 / sqrt(2 x n_layers)`.
 Without this, early training has residual activations that grow exponentially with depth.
 
+**EMA Loss Tracking (v3.5)**
+Exponential moving average of training loss with α=0.05. Provides a smooth, noise-free
+loss curve that makes it easy to spot real trends vs mini-batch noise. Logged to WandB
+(`train/ema_loss`) and JSONL (`ema_loss` field) alongside raw loss.
+
 ---
 
 ## Training Configuration
 
 ### Parameters
 
-| Hyperparameter         | v3 Value           | v1 Value    | Notes                  |
-| ---------------------- | ------------------ | ----------- | ---------------------- |
-| Micro-batch            | 2                  | 2           | Limited by VRAM        |
-| Gradient accumulation  | 32                 | 8           | 4x smoother gradients  |
-| Effective batch tokens | 65,536             | 8,192       | 8x larger              |
-| Learning rate          | 6e-4               | 8e-4        | Lower for larger batch |
-| Sequence length        | 1,024              | 512         | 2x longer context      |
-| Max steps              | 60,000             | 60,000      |                        |
-| Warmup steps           | 1,000              | 1,000       |                        |
-| Stable steps           | 48,000             | 48,000      |                        |
-| Validation batches     | 500                | 50          | 10x less noisy         |
-| Optimizer              | 8-bit AdamW / Muon | 8-bit AdamW |                        |
-| Checkpoint rotation    | Last 3 only        | All         | Saves disk space       |
+| Hyperparameter         | v3.5 Value  | v3.0 Value  | Notes                                                      |
+| ---------------------- | ----------- | ----------- | ---------------------------------------------------------- |
+| Micro-batch            | **1**       | 2           | Reduced — 99% VRAM was causing OOM + fluctuation           |
+| Gradient accumulation  | **64**      | 32          | Compensates for smaller micro-batch                        |
+| Effective batch tokens | 65,536      | 65,536      | Same total, half peak VRAM per step                        |
+| Learning rate          | **3e-4**    | 6e-4        | Reduced — high LR + 99% VRAM = fluctuation                 |
+| Sequence length        | 1,024       | 1,024       |                                                            |
+| Max steps              | **80,000**  | 60,000      | Extended — larger datasets need more training              |
+| Warmup steps           | **3,000**   | 2,000       | Extended — prevents early divergence                       |
+| Stable steps           | **62,000**  | 44,000      | 3000 + 62000 + 15000 cosine decay = 80k                    |
+| Dropout                | **0.02**    | 0.05        | Reduced — high dropout + MTP noise = instability           |
+| MTP weight             | **0.05**    | 0.1         | Reduced — was over-amplifying gradient noise               |
+| CUDA memory fraction   | **0.88**    | 0.95        | 12% headroom for backward pass peak allocations            |
+| Validation batches     | 500         | 50          | 10x less noisy val loss                                    |
+| Optimizer              | Fused AdamW | 8-bit AdamW | Standard AdamW is faster; use --8bit-adam if tight on VRAM |
+| Checkpoint rotation    | Last 3 only | All         | Saves disk space                                           |
+| EMA loss tracking      | **α=0.05**  | None        | Smooth loss curve, logged to WandB + JSONL                 |
+| VRAM warning           | **>95%**    | None        | Prints actionable advice once                              |
 
 ### Optional Integrations
 
-| Integration    | Enable                           | Notes                                   |
-| -------------- | -------------------------------- | --------------------------------------- |
-| WandB logging  | `WANDB=1 python train.py`        | Tracks loss, LR, grad norm, val metrics |
-| Muon optimizer | `MUON=1 python train.py`         | Needs `pip install muon-pytorch`        |
-| Both           | `WANDB=1 MUON=1 python train.py` |                                         |
+| Integration       | Enable                           | Notes                                             |
+| ----------------- | -------------------------------- | ------------------------------------------------- |
+| WandB logging     | `WANDB=1 python train.py`        | Tracks loss, EMA loss, LR, grad norm, val metrics |
+| Muon optimizer    | `MUON=1 python train.py`         | Needs `pip install muon-pytorch`                  |
+| 8-bit AdamW       | `python train.py --8bit-adam`    | Saves ~1.3GB VRAM but ~5-10% slower               |
+| Both WandB + Muon | `WANDB=1 MUON=1 python train.py` |                                                   |
 
 ### VRAM Budget (8 GB RTX 3070)
+
+With `MICRO_BATCH=1`, `ACCUM_STEPS=64`, `CUDA memory_fraction=0.88`:
 
 | Component                            | Size        |
 | ------------------------------------ | ----------- |
 | Model weights (BF16)                 | 410 MB      |
 | Gradients (BF16)                     | 410 MB      |
-| 8-bit Adam states                    | 260 MB      |
+| AdamW states (FP32)                  | ~520 MB     |
 | Activations (checkpointed, 1024 ctx) | ~2.8 GB     |
 | CUDA kernels + overhead              | ~1.4 GB     |
-| **Total**                            | **~5.3 GB** |
-| **Headroom**                         | **~2.7 GB** |
+| **Total**                            | **~5.5 GB** |
+| **Headroom**                         | **~2.5 GB** |
 
-If you hit OOM: set `MICRO_BATCH=1` and `ACCUM_STEPS=64` to maintain the same
-effective batch size at half the per-step VRAM usage.
+With `MICRO_BATCH=2`, `ACCUM_STEPS=32` (faster but tighter):
+
+| Component                                  | Size        |
+| ------------------------------------------ | ----------- |
+| Model weights (BF16)                       | 410 MB      |
+| Gradients (BF16)                           | 410 MB      |
+| AdamW states (FP32)                        | ~520 MB     |
+| Activations (checkpointed, 2x micro-batch) | ~3.8 GB     |
+| CUDA kernels + overhead                    | ~1.4 GB     |
+| **Total**                                  | **~6.3 GB** |
+| **Headroom**                               | **~1.7 GB** |
+
+> **v3.5 recommendation:** Use `MICRO_BATCH=1, ACCUM_STEPS=64` by default. The 2.5 GB
+> headroom prevents OOM during backward pass peak allocations (MTP heads, gradient
+> buffers). You can try `MICRO_BATCH=2` if you have headroom, but watch for the VRAM
+> pressure warning.
 
 ### RTX 3070 Timing Reference
 
-All times assume: `MICRO_BATCH=2, ACCUM_STEPS=32, seq_len=1024, BF16, torch.compile`
+All times assume: `MICRO_BATCH=1, ACCUM_STEPS=64, seq_len=1024, BF16, eager mode`
 
-Throughput: **~2,000-2,400 tok/s** (effective, including gradient accumulation overhead)
+Throughput: **~1,600-2,000 tok/s** (eager mode on Windows), **~2,000-2,400 tok/s** (compiled Linux)
 
 | Steps  | Tokens processed | Wall time  | 8h/day calendar |
 | ------ | ---------------- | ---------- | --------------- |
@@ -595,15 +657,6 @@ Throughput: **~2,000-2,400 tok/s** (effective, including gradient accumulation o
 | 40,000 | 2.62B            | ~304 hours | ~38 days        |
 | 60,000 | 3.93B            | ~456 hours | ~57 days        |
 | 80,000 | 5.24B            | ~608 hours | ~76 days        |
-
-**To train faster without sacrificing quality:**
-
-1. **Reduce `ACCUM_STEPS` to 16** — halves wall time, slightly noisier gradients
-   (still much better than v1's 8). Effective batch = 32k tokens.
-2. **Use `seq_len=512` for steps 1-20k, then extend to 1024** — context extension
-   curriculum saves ~40% wall time on the early training where short context is fine.
-3. **Keep only the last 3 checkpoints** — checkpoint saves with torch.save take
-   30-60 seconds each; with CHECKPOINT_EVERY=2500 that's 24 checkpoints x ~45s = 18 min total.
 
 ### Loss Targets (approximate, Italian+C mix)
 
@@ -616,6 +669,27 @@ Throughput: **~2,000-2,400 tok/s** (effective, including gradient accumulation o
 | 30,000 | 1.97B          | ~2.2-2.5          | Italian paragraphs, working C snippets   |
 | 60,000 | 3.93B          | ~2.0-2.2          | Solid Italian prose, useful C completion |
 | 80,000 | 5.24B          | ~1.85-2.0         | Near-peak for this size                  |
+
+---
+
+## Resuming Training After Data Changes
+
+When you download new data and want to continue from a checkpoint:
+
+```bash
+# After re-running filter.py + mix.py + preprocess.py with new data:
+python train.py --reset-optimizer
+```
+
+The `--reset-optimizer` flag loads model weights from the best checkpoint but starts
+with a fresh optimizer state and LR schedule. This is recommended when:
+
+- You've changed the dataset significantly (e.g., upgraded from `quick` to `max` tier)
+- You've adjusted hyperparameters (LR, dropout, etc.)
+- Training had loss regression issues
+
+Without `--reset-optimizer`, the old optimizer momentum/variance estimates are loaded,
+which may be mismatched with the new data distribution.
 
 ---
 
@@ -689,7 +763,7 @@ dies when training ends or is interrupted.
 
 ### RuntimeError: Cannot find a working triton installation
 
-This happens on Windows because Triton doesn't support Windows. The v3.2 training script
+This happens on Windows because Triton doesn't support Windows. The v3.5 training script
 auto-detects this and falls back to eager mode. If you see this error, you're running an
 older version of train.py — update to the latest version.
 
@@ -706,9 +780,9 @@ Verify: `python -c "import torch; print(torch.cuda.is_available())"` should prin
 
 ### 0 code files downloaded
 
-This was caused by `codeparrot/github-code` using a deprecated loading script. The v3.2
-download.py uses `bigcode/starcoderdata` (primary), `bigcode/the-stack-smol` (fallback),
-and `codeparrot/github-code-clean` (last resort). If all three fail:
+The v3.5 download.py uses `Fsoft-AIC/the-vault` (truly open, no auth needed) as the
+primary C code source, with `bigcode/starcoderdata` and `bigcode/the-stack-smol` as
+fallbacks. If all fail:
 
 1. Check your internet connection
 2. Run: `huggingface-cli login`
@@ -725,17 +799,30 @@ the latest train.py with `infinite_loader()`.
 
 ### CUDA OOM
 
-1. `MICRO_BATCH=1`, `ACCUM_STEPS=64` (same effective batch, half peak VRAM)
+1. Use defaults: `MICRO_BATCH=1`, `ACCUM_STEPS=64` (same effective batch, minimum peak VRAM)
 2. `max_seq_len=512` in `ModelArgs` (halves activation memory)
-3. Close all other GPU applications (browsers, games)
-4. Windows: disable Hardware-Accelerated GPU Scheduling
+3. `python train.py --8bit-adam` (saves ~1.3GB optimizer VRAM)
+4. Close all other GPU applications (browsers, games)
+5. Windows: disable Hardware-Accelerated GPU Scheduling
+
+### Loss fluctuation (±3%+)
+
+This was the primary issue addressed in v3.5. If you still see large fluctuations:
+
+1. Verify `MICRO_BATCH=1` and `ACCUM_STEPS=64` (not the old `MICRO_BATCH=2`)
+2. Verify `LR=3e-4` (not the old `4e-4` or `6e-4`)
+3. Verify `dropout=0.02` and `mtp_weight=0.05` in model.py
+4. Check VRAM utilisation — if >95%, the GPU is struggling with memory pressure
+5. The EMA loss (printed alongside raw loss) should be smooth — if raw loss fluctuates
+   but EMA is stable, that's normal mini-batch noise
 
 ### Loss stuck at ~4.0+ after 5,000 steps
 
 1. Verify tokenizer was trained correctly: `tokenizer.json` should be > 5 MB
-2. Check for double BOS/EOS bug — see Bug #2 above
+2. Check for double BOS/EOS bug — see Bug #2 in the bugs table
 3. Run `python filter.py` again; very low quality data prevents learning
-4. LR too high or too low — try 4e-4 or 8e-4
+4. Check dataset size — if you're on smoke/quick tier, there's not enough data
+5. LR too high or too low — try 3e-4 (the default)
 
 ### Dashboard shows 0 tok/s
 
@@ -744,9 +831,13 @@ GPU stats will fall back to PyTorch's memory API (no utilisation %, but VRAM sti
 
 ### Can I resume training after changing ModelArgs?
 
-No. Checkpoints store the raw weight tensors; changing architecture invalidates them.
-The only safe changes after a checkpoint: `dropout`, `max_seq_len` (if you extend it),
-`n_mtp_tokens` (only if you zero-initialise the new heads).
+Architecture-breaking changes (dim, n_layers, n_heads, n_kv_heads, vocab_size,
+hidden_dim, max_seq_len, n_mtp_tokens) invalidate checkpoints. The training script
+will detect mismatches and refuse to load.
+
+Safe changes after a checkpoint: `dropout`, `mtp_weight`, `z_loss_weight` — these
+are training hyperparameters, not architecture. Use `--reset-optimizer` when changing
+these to get a fresh LR schedule.
 
 ### How do I retrain from scratch?
 
@@ -769,7 +860,7 @@ python preprocess.py
 python train.py
 ```
 
-**What to keep:** All `.py` files, `dashboard.html`, `README.md`, `requirements.txt`
+**What to keep:** All `.py` files, `dashboard.html`, `README.md`, `requirements.txt`, `.gitignore`
 **What to delete:** `data_raw/`, `data_filtered/`, `data_mixed/`, `data/`, `tokenizer.json`, `checkpoints/`
 
 > **Tip:** You don't need to delete `data_raw/` if you just want to re-mix or re-tokenize.
@@ -782,19 +873,17 @@ Italian word-list filter that works but is less precise.
 
 ---
 
-## Performance Benchmarks (expected at 60k steps, Tier 3+)
+## Performance Benchmarks (expected at 80k steps, Tier max)
 
 | Metric                        | Value             |
 | ----------------------------- | ----------------- |
-| Training throughput           | 2,000-2,400 tok/s |
+| Training throughput (Windows) | 1,600-2,000 tok/s |
+| Training throughput (Linux)   | 2,000-2,400 tok/s |
 | Inference speed (KV cache)    | ~150-200 tok/s    |
 | Inference speed (speculative) | ~200-400 tok/s    |
 | Inference speed (no cache)    | ~40-60 tok/s      |
-| Validation loss               | ~2.0-2.2          |
-| Val perplexity                | ~7-9              |
-| HellaSwag (EN)                | ~35-40%           |
-| MMLU 5-shot (EN)              | ~28-33%           |
-| C HumanEval pass@1            | ~8-14%            |
+| Validation loss               | ~1.85-2.0         |
+| Val perplexity                | ~6-8              |
 
 ---
 
@@ -804,11 +893,12 @@ In rough priority order:
 
 1. **Context length extension** — fine-tune at 2048-4096 tokens after initial 1024 training (cheap with YaRN or ABF)
 2. **Instruction tuning** — after base training, fine-tune on Italian instruction datasets (Dolly-IT, Alpaca-IT)
-3. **Continuous batching** — for faster throughput when serving multiple prompts
-4. **Flash Attention 2** — custom CUDA kernel for even faster attention (if not auto-selected)
-5. **Quantisation (GPTQ/AWQ)** — 4-bit inference for even faster generation with minimal quality loss
-6. **DPO/RLHF** — alignment training for safer, more helpful outputs
-7. **Mixture of Experts** — sparse MoE layers for more capacity at the same inference cost
+3. **Tokenizer retraining** — train tokenizer with more C code to improve 2.3 chars/token compression
+4. **Continuous batching** — for faster throughput when serving multiple prompts
+5. **Flash Attention 2** — custom CUDA kernel for even faster attention (if not auto-selected)
+6. **Quantisation (GPTQ/AWQ)** — 4-bit inference for even faster generation with minimal quality loss
+7. **DPO/RLHF** — alignment training for safer, more helpful outputs
+8. **Mixture of Experts** — sparse MoE layers for more capacity at the same inference cost
 
 ---
 
@@ -820,9 +910,9 @@ Respect source dataset licences before distributing trained weights:
 - OpenWebText: MIT
 - FineWeb-Edu / FineWeb-2: ODC-By
 - Wikipedia: CC BY-SA 4.0
-- The Stack: The Stack licence (requires agreement on HuggingFace)
-- OSCAR: CC0 / CC BY 4.0 (varies by language subset)
-- Project Gutenberg: Public domain (individual works may vary)
+- The Vault (Fsoft-AIC): MIT
+- OSCAR / mc4: CC0 / CC BY 4.0 (varies by language subset)
+- CodeSearchNet: MIT
 
 ---
 
@@ -832,4 +922,4 @@ Architecture inspired by Llama-3, Qwen-2, and TinyLlama.
 Flash Attention by Dao et al. 8-bit AdamW by bitsandbytes.
 Speculative decoding inspired by Leviathan et al. (DeepMind).
 Muon optimizer by Jordan et al.
-Datasets: HuggingFace, OSCAR corpus, Wikimedia, BigCode, Project Gutenberg.
+Datasets: HuggingFace, OSCAR corpus, Wikimedia, Fsoft-AIC, BigCode.

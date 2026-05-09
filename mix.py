@@ -36,15 +36,18 @@ random.seed(SEED)
 # ─── Data Mix Configuration ──────────────────────────────────────────────────
 
 # Target total documents (overridden by what's actually available)
-TARGET_TOTAL = 7_000_000
+TARGET_TOTAL = 10_000_000  # Increased for max tier — more data = better model
 
 # Category -> target ratio (must sum to 1.0)
+# Optimized for: Italian chatting + C coding (struct-level knowledge)
+# Previous mix: 45% Italian, 20% C, 5% C++, 5% other code, 25% English
+# New mix: More C code (35%), enough Italian (35%), less English (15%)
 RATIOS = {
-    'italian':    0.45,   # Italian web + edu + wiki + gutenberg
-    'c_code':     0.20,   # C programming
+    'italian':    0.35,   # Italian web + edu + wiki — enough for chat
+    'c_code':     0.35,   # C programming — PRIMARY skill target
     'cpp_code':   0.05,   # C++ programming (complements C)
-    'other_code': 0.05,   # Python, JS, Bash, Rust, StackOverflow
-    'english':    0.25,   # English web + edu + wiki + gutenberg
+    'other_code': 0.10,   # Python, JS, Bash, Rust — general code understanding
+    'english':    0.15,   # English web + edu + wiki — reduced, not primary goal
 }
 
 # File pattern -> category mapping (more robust than basename matching)
@@ -169,8 +172,8 @@ def main():
     print(f"\nShuffling {len(all_lines):,} documents...")
     random.shuffle(all_lines)
 
-    # Split: 99% train, 1% validation
-    split = int(len(all_lines) * 0.99)
+    # Split: 98% train, 2% validation (more data = can afford bigger val split for stable eval)
+    split = int(len(all_lines) * 0.98)
     train_lines = all_lines[:split]
     val_lines = all_lines[split:]
 

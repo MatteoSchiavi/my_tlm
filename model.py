@@ -37,8 +37,8 @@ class ModelArgs:
     max_seq_len: int = 1024          # Extended from 512 — fits in 8GB with checkpointing
     use_checkpointing: bool = True    # ON by default — REQUIRED for 8GB VRAM (saves ~40% activation memory)
     n_mtp_tokens: int = 2
-    mtp_weight: float = 0.1      # Reduced from 0.3 — was causing loss regression by over-amplifying gradients
-    dropout: float = 0.05
+    mtp_weight: float = 0.05     # Reduced from 0.1 — auxiliary MTP loss adds high-variance gradients that amplify fluctuation
+    dropout: float = 0.02        # Reduced from 0.05 — less stochastic noise in forward pass, smoother training
     rope_theta: float = 500_000.0   # Llama 3 style — much better length generalization
     z_loss_weight: float = 1e-4     # PaLM/Gemma — prevents logit explosion, replaces spike detector
 

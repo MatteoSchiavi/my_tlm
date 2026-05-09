@@ -87,11 +87,11 @@ TIERS = {
         'italian_oscar':      1_000_000,
         'italian_wiki':       60_000,
         'italian_fineweb':    600_000,
-        'english_web':        2_000_000,
-        'english_wiki':       600_000,
-        'english_edu':        1_200_000,
-        'c_code':             800_000,
-        'other_code':         400_000,
+        'english_web':        600_000,    # Reduced — English not primary goal
+        'english_wiki':       200_000,    # Reduced — enough for general knowledge
+        'english_edu':        400_000,    # Reduced — enough for general knowledge
+        'c_code':             1_200_000,  # BOOSTED — primary skill (was 800k)
+        'other_code':         600_000,    # Boosted — helps general code understanding
     },
 }
 
