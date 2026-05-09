@@ -94,39 +94,45 @@ class KVCache:
     """Per-layer key/value cache for fast autoregressive generation.
     Stores pre-computed K,V tensors so we only process the new token
     at each generation step instead of the full context window.
-    Provides ~4-5x speedup during inference."""
-    k: torch.Tensor  # (batch, n_kv_heads, seq_len, head_dim)
-    v: torch.Tensor  # (batch, n_kv_heads, seq_len, head_dim)
+    Provides ~4-5x speedup during inference.
+
+    Uses pre-allocated fixed-size tensors and tracks active_len to avoid
+    torch.cat() allocations during generation. truncate() adjusts active_len
+    without reshaping the underlying buffer, so subsequent update() calls
+    can safely overwrite positions beyond the truncation point."""
+    k: torch.Tensor  # (batch, n_kv_heads, max_seq_len, head_dim) — pre-allocated
+    v: torch.Tensor  # (batch, n_kv_heads, max_seq_len, head_dim) — pre-allocated
     max_seq_len: int = 0  # Guard: prevents unbounded growth
+    active_len: int = 0   # Tracks logical length of valid cache entries
 
     def update(self, k_new: torch.Tensor, v_new: torch.Tensor,
                start_pos: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Update cache with new K,V and return the full cached tensors.
-        On the first call (start_pos=0), we store k_new/v_new directly.
-        On subsequent calls, we append k_new/v_new to the existing cache.
-        Enforces max_seq_len guard to prevent unbounded memory growth."""
-        if start_pos == 0:
-            self.k = k_new
-            self.v = v_new
-        else:
-            self.k = torch.cat([self.k, k_new], dim=2)
-            self.v = torch.cat([self.v, v_new], dim=2)
-
-        # Enforce max_seq_len guard — trim oldest entries if cache exceeds limit
-        if self.max_seq_len > 0 and self.k.shape[2] > self.max_seq_len:
-            self.k = self.k[:, :, -self.max_seq_len:, :]
-            self.v = self.v[:, :, -self.max_seq_len:, :]
-
-        return self.k, self.v
+        """Update cache with new K,V using slice assignment (no tensor allocation).
+        Writes into the pre-allocated buffer at start_pos and updates active_len.
+        Returns views into the active portion of the cache (0..active_len)."""
+        sl = k_new.shape[2]
+        # Write new values into pre-allocated buffer at the correct offset
+        self.k[:, :, start_pos:start_pos + sl, :] = k_new
+        self.v[:, :, start_pos:start_pos + sl, :] = v_new
+        # Update logical length
+        self.active_len = start_pos + sl
+        return self.k[:, :, :self.active_len, :], self.v[:, :, :self.active_len, :]
 
     def truncate(self, length: int):
         """Truncate cache to the given length (keeps entries from position 0 to length-1).
         Used in speculative decoding when some draft tokens are rejected — the cache
         has entries for positions 0..cur_pos+len(draft)-1, and we want to keep only
-        0..cur_pos+accepted-1, so we call truncate(cur_pos + accepted)."""
-        if length < self.k.shape[2]:
-            self.k = self.k[:, :, :length, :]
-            self.v = self.v[:, :, :length, :]
+        0..cur_pos+accepted-1, so we call truncate(cur_pos + accepted).
+
+        Instead of reshaping the tensor (which would break subsequent update()
+        slice-assignment), we zero out positions beyond 'length' and adjust active_len.
+        The next update() call will overwrite these zeroed positions."""
+        if length < self.active_len:
+            # Zero out positions beyond the truncation point so stale data
+            # doesn't leak into future attention computations
+            self.k[:, :, length:self.active_len, :].zero_()
+            self.v[:, :, length:self.active_len, :].zero_()
+            self.active_len = length
 
 
 # ─── Attention ────────────────────────────────────────────────────────────────
@@ -181,12 +187,29 @@ class Attention(nn.Module):
             xv = xv.unsqueeze(2).expand(-1, -1, self.repeats, -1, -1).reshape(
                 bsz, self.n_heads, xv.shape[2], self.head_dim)
 
-        # When using KV cache, xq has seqlen=1 but xk/xv have full cached length
-        # We need a causal mask that allows attending to all past positions
+        # Attention mask logic:
+        # - Training / prefill (no cache): use causal mask via is_causal=True
+        # - Single-token generation (cache, seqlen=1): no mask needed
+        # - Multi-token verify (cache, seqlen>1, speculative decoding):
+        #   Need causal mask among new tokens, but all attend to cached tokens
         if kv_cache is not None and start_pos > 0:
-            # No mask needed — we only have 1 query token attending to all previous
-            attn_mask = None
-            is_causal = False
+            if seqlen == 1:
+                # Standard single-token generation: no mask needed
+                attn_mask = None
+                is_causal = False
+            else:
+                # Multi-token verify pass (speculative decoding):
+                # Need causal mask within the new tokens, but all attend to cached tokens
+                # Build explicit mask: (seqlen, total_len) where total_len = cached + new
+                cached_len = xk.shape[2] - seqlen  # kv_cache was already updated
+                # All new queries can attend to all cached tokens (zero in cached region)
+                # New queries are causal among themselves (upper triangle = -inf)
+                mask = torch.zeros(seqlen, xk.shape[2], device=x.device, dtype=x.dtype)
+                mask[:, cached_len:] = torch.triu(
+                    torch.full((seqlen, seqlen), float('-inf'), device=x.device), diagonal=1
+                )
+                attn_mask = mask
+                is_causal = False
         else:
             attn_mask = None
             is_causal = True
@@ -382,7 +405,11 @@ class Transformer(nn.Module):
 
     def init_kv_caches(self, batch_size: int, device: torch.device,
                        dtype: torch.dtype = torch.bfloat16) -> List[KVCache]:
-        """Initialize empty KV caches for all layers. Call once before generation.
+        """Initialize pre-allocated KV caches for all layers. Call once before generation.
+
+        Pre-allocates the full cache tensor (max_seq_len positions) to avoid
+        repeated torch.cat() allocations during autoregressive generation.
+        This eliminates ~1024 tensor allocations and copies per generation call.
 
         Args:
             batch_size: Number of sequences (usually 1 for single-prompt generation)
@@ -393,14 +420,15 @@ class Transformer(nn.Module):
             List of KVCache objects, one per transformer layer
         """
         head_dim = self.args.dim // self.args.n_heads
+        max_len = self.args.max_seq_len
         caches = []
         for _ in range(self.args.n_layers):
-            # Pre-allocate with zero tensors — will be filled during first forward pass
-            k = torch.zeros(batch_size, self.args.n_kv_heads, 0, head_dim,
+            # Pre-allocate full cache: [batch, heads, max_seq_len, head_dim]
+            k = torch.zeros(batch_size, self.args.n_kv_heads, max_len, head_dim,
                            device=device, dtype=dtype)
-            v = torch.zeros(batch_size, self.args.n_kv_heads, 0, head_dim,
+            v = torch.zeros(batch_size, self.args.n_kv_heads, max_len, head_dim,
                            device=device, dtype=dtype)
-            caches.append(KVCache(k=k, v=v, max_seq_len=self.args.max_seq_len))
+            caches.append(KVCache(k=k, v=v, max_seq_len=max_len))
         return caches
 
 

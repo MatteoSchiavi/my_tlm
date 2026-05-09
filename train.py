@@ -75,8 +75,6 @@ import http.server
 import socketserver
 import subprocess
 import argparse
-from pathlib import Path
-from collections import deque
 
 # Suppress Windows symlink warnings from huggingface_hub
 os.environ.setdefault('HF_HUB_DISABLE_SYMLINKS_WARNING', '1')
@@ -106,8 +104,11 @@ except ImportError:
 MICRO_BATCH = 1             # 1 is critical for 8GB VRAM — MICRO_BATCH=2 uses 99.2% VRAM causing instability!
 ACCUM_STEPS = 64            # 1*64*1024 = 65,536 tokens/step — same effective batch as 2*32
 MAX_STEPS = 80_000          # Increased from 60k for max dataset — more data needs more steps
-WARMUP_STEPS = 3000         # Extended from 2000 — smoother ramp-up reduces early loss fluctuation
-STABLE_STEPS = 57_000       # Adjusted to account for longer warmup and more steps
+WARMUP_FRACTION = 0.0375    # ~3000/80000 — warmup phase (4% of training)
+STABLE_FRACTION = 0.7125    # ~57000/80000 — stable phase (71% of training)
+# Decay phase = remaining ~25% — cosine decay from LR to MIN_LR
+# These fractions auto-adjust when MAX_STEPS changes, preventing the
+# schedule from breaking on resume with different step counts.
 LR = 3e-4                   # Reduced from 4e-4 — smoother convergence, less per-step oscillation
 MIN_LR = 1e-5
 WEIGHT_DECAY = 0.1
@@ -213,12 +214,26 @@ def _save_checkpoint(raw_model, optimizer, step, best_val, path):
 
 # ─── Learning Rate Schedule (WSD: Warmup -> Stable -> Decay) ──────────────────
 
-def get_lr(step):
-    if step < WARMUP_STEPS:
-        return LR * (step + 1) / WARMUP_STEPS
-    if step < STABLE_STEPS:
+def get_lr(step, max_steps=None):
+    """WSD (Warmup-Stable-Decay) learning rate schedule with fractional phases.
+    
+    Uses fractions of max_steps instead of absolute step counts, so the schedule
+    auto-adjusts when MAX_STEPS changes (e.g., extending training on resume).
+    
+    Phases:
+      - Warmup: WARMUP_FRACTION of training — linear ramp from 0 to LR
+      - Stable: STABLE_FRACTION of training — constant LR
+      - Decay: remaining fraction — cosine decay from LR to MIN_LR
+    """
+    if max_steps is None:
+        max_steps = MAX_STEPS
+    warmup = int(max_steps * WARMUP_FRACTION)
+    stable = int(max_steps * STABLE_FRACTION)
+    if step < warmup:
+        return LR * (step + 1) / max(warmup, 1)
+    if step < stable:
         return LR
-    decay_ratio = (step - STABLE_STEPS) / (MAX_STEPS - STABLE_STEPS)
+    decay_ratio = (step - stable) / max(max_steps - stable, 1)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return MIN_LR + coeff * (LR - MIN_LR)
 
@@ -292,6 +307,7 @@ class TrainingMetrics:
             'gpu_mem_used_mb': 0,
             'gpu_mem_total_mb': 0,
             'gpu_util_pct': 0,
+            'gpu_mem_reserved_mb': 0,
             'best_val': float('inf'),
             'loss_history': [],
             'val_history': [],
@@ -335,56 +351,53 @@ metrics = TrainingMetrics()
 
 # ─── GPU Stats ────────────────────────────────────────────────────────────────
 
-# Cache GPU stats to avoid calling nvidia-smi every step (Minor Issue 6 fix)
-_gpu_stats_cache = {'data': None, 'step': -1}
-_GPU_STATS_INTERVAL = 10  # Only query nvidia-smi every N steps
+# Background nvidia-smi polling for GPU utilization % (updated every 30 seconds)
+_gpu_util_cache = {'pct': 0, 'last_query_time': 0}
+_GPU_UTIL_POLL_INTERVAL = 30  # seconds between nvidia-smi queries
+
+def _poll_gpu_util():
+    """Background poll nvidia-smi for GPU utilization %.
+    Called at most once every 30 seconds to avoid subprocess overhead."""
+    if not HAS_CUDA:
+        return 0
+    now = time.time()
+    if now - _gpu_util_cache['last_query_time'] < _GPU_UTIL_POLL_INTERVAL:
+        return _gpu_util_cache['pct']
+    _gpu_util_cache['last_query_time'] = now
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=utilization.gpu',
+             '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0:
+            _gpu_util_cache['pct'] = int(result.stdout.strip())
+    except Exception:
+        pass
+    return _gpu_util_cache['pct']
+
 
 def get_gpu_stats(step=None):
-    """Query nvidia-smi for GPU memory and utilisation.
-    Results are cached for 10 steps to avoid ~10ms latency per call."""
-    if step is not None and _gpu_stats_cache['step'] >= 0:
-        if step - _gpu_stats_cache['step'] < _GPU_STATS_INTERVAL:
-            return _gpu_stats_cache['data']
-
-    result = _query_gpu_stats()
-    _gpu_stats_cache['data'] = result
-    _gpu_stats_cache['step'] = step or 0
-    return result
-
-
-def _query_gpu_stats():
-    """Actual GPU stats query."""
-    # Try nvidia-smi first (gives utilisation %)
-    if HAS_CUDA:
-        try:
-            result = subprocess.run(
-                ['nvidia-smi', '--query-gpu=memory.used,memory.total,utilization.gpu',
-                 '--format=csv,noheader,nounits'],
-                capture_output=True, text=True, timeout=2
-            )
-            if result.returncode == 0:
-                parts = result.stdout.strip().split(',')
-                if len(parts) >= 3:
-                    return {
-                        'gpu_mem_used_mb': int(parts[0].strip()),
-                        'gpu_mem_total_mb': int(parts[1].strip()),
-                        'gpu_util_pct': int(parts[2].strip()),
-                    }
-        except Exception:
-            pass
-
-    # Fallback: PyTorch only (no utilisation %)
-    if HAS_CUDA:
-        try:
-            return {
-                'gpu_mem_used_mb': torch.cuda.memory_allocated() // 1024 // 1024,
-                'gpu_mem_total_mb': torch.cuda.get_device_properties(0).total_mem // 1024 // 1024,
-                'gpu_util_pct': 0,
-            }
-        except Exception:
-            pass
-
-    return {'gpu_mem_used_mb': 0, 'gpu_mem_total_mb': 0, 'gpu_util_pct': 0}
+    """Get GPU memory stats using PyTorch native API (zero overhead).
+    GPU utilization % is polled from nvidia-smi at most once every 30 seconds
+    in a background thread to avoid subprocess overhead during training."""
+    if not HAS_CUDA:
+        return {'gpu_mem_used_mb': 0, 'gpu_mem_total_mb': 0, 'gpu_util_pct': 0,
+                'gpu_mem_reserved_mb': 0}
+    try:
+        allocated = torch.cuda.memory_allocated() // (1024 * 1024)
+        reserved = torch.cuda.memory_reserved() // (1024 * 1024)
+        total = torch.cuda.get_device_properties(0).total_memory // (1024 * 1024)
+        util_pct = _poll_gpu_util()
+        return {
+            'gpu_mem_used_mb': allocated,
+            'gpu_mem_reserved_mb': reserved,
+            'gpu_mem_total_mb': total,
+            'gpu_util_pct': util_pct,
+        }
+    except Exception:
+        return {'gpu_mem_used_mb': 0, 'gpu_mem_total_mb': 0, 'gpu_util_pct': 0,
+                'gpu_mem_reserved_mb': 0}
 
 
 # ─── Dashboard HTTP Server ───────────────────────────────────────────────────
@@ -466,7 +479,7 @@ def cleanup_old_checkpoints():
     Never deletes best.pt or final.pt."""
     ckpt_files = sorted(
         [f for f in os.listdir(CHECKPOINT_DIR) if f.startswith('ckpt_') and f.endswith('.pt')],
-        key=lambda f: int(f.split('_')[1].split('.')[0])
+        key=lambda f: int(f.split('_')[-1].split('.')[0])
     )
     while len(ckpt_files) > MAX_CHECKPOINTS:
         oldest = ckpt_files.pop(0)
