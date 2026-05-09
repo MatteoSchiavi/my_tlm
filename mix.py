@@ -22,7 +22,9 @@ Data mix ratios (by TOKEN count, not document count):
 
 Other v2 fixes:
   + Token-based (character proxy) mixing instead of document-based
-  + Explicit warning for uncategorized files instead of silent English assignment
+  + Hard error on uncategorized files (no silent English pollution)
+    --allow-unknown places them in 'unknown' bucket (excluded from training)
+    with per-file diagnostics and likely-category inference
   + Detailed token ratio reporting
   + Code-aware category detection
   + Per-file reservoir sampling (fixes cross-file bias)
@@ -34,7 +36,10 @@ import os
 import json
 import random
 import glob
+import time
+import argparse
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 os.makedirs("data_mixed", exist_ok=True)
 
@@ -75,6 +80,7 @@ DEFAULT_CHARS_PER_TOKEN = {
     'cpp_code':   3.2,
     'other_code': 3.3,
     'english':    4.3,
+    'unknown':    4.0,  # Fallback — no training ratio, excluded from sampling
 }
 
 
@@ -94,12 +100,54 @@ def count_lines(path):
         return sum(1 for _ in f)
 
 
-# Cache line counts to avoid re-reading files
+def _scan_file(path):
+    """Scan a file for stats: (path, line_count, avg_chars, total_est_chars).
+    Called in parallel for I/O-bound file scanning."""
+    line_count = 0
+    total_chars = 0
+    sample_count = 0
+    SAMPLE_LIMIT = 1000
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line_count += 1
+                if sample_count < SAMPLE_LIMIT:
+                    try:
+                        text = json.loads(line).get('text', '')
+                        total_chars += len(text)
+                        sample_count += 1
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+    except Exception:
+        return path, 0, 0, 0
+    avg_chars = total_chars / max(sample_count, 1)
+    return path, line_count, avg_chars, avg_chars * line_count
+
+
+# Cache for single-file access (used by calibrate_chars_per_token)
 _line_count_cache = {}
 def cached_count_lines(path):
     if path not in _line_count_cache:
         _line_count_cache[path] = count_lines(path)
     return _line_count_cache[path]
+
+
+def parallel_scan_files(paths, workers=4):
+    """Scan multiple files in parallel for line counts and char estimates.
+    Returns dict: path -> (line_count, avg_chars, est_total_chars)"""
+    results = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_scan_file, p): p for p in paths}
+        for future in as_completed(futures):
+            try:
+                path, line_count, avg_chars, est_total = future.result()
+                results[path] = (line_count, avg_chars, est_total)
+            except Exception:
+                pass
+    # Also populate the line count cache
+    for path, (line_count, _, _) in results.items():
+        _line_count_cache[path] = line_count
+    return results
 
 
 def estimate_chars(path, sample_size=1000):
@@ -212,8 +260,96 @@ def reservoir_sample_by_chars(paths, char_budget, seed=SEED):
     return sample, total_chars, total_docs_available
 
 
-def collect_files():
-    """Find and categorize all filtered JSONL files."""
+def _infer_likely_category(filepath):
+    """Infer the most likely category for an uncategorized file by heuristics.
+
+    Checks both the filename and (if available) a small sample of file content
+    for signals like code characters, Italian words, etc.
+
+    Returns (likely_category, confidence) where confidence is 'high'/'medium'/'low'.
+    """
+    path_lower = filepath.lower()
+    fname = os.path.basename(path_lower)
+
+    # ── Filename-based heuristics ──
+
+    # Code signals in filename
+    code_fname_signals = ['c_code', 'cpp_code', 'code', 'github', 'stack',
+                          'vault', 'starcoder', 'codesearchnet', 'python',
+                          'javascript', 'rust', 'shell', 'golang', 'java',
+                          'algorithm', 'competitive', 'leetcode', 'hackerrank']
+    code_hits = sum(1 for s in code_fname_signals if s in fname)
+    if code_hits >= 2:
+        return 'c_code', 'high'
+    if code_hits == 1:
+        return 'other_code', 'medium'
+
+    # Italian signals in filename
+    italian_fname_signals = ['ital', 'ita_', 'it_', '_it.', 'oscar', 'fineweb_it']
+    if any(s in fname for s in italian_fname_signals):
+        return 'italian', 'high'
+
+    # English signals in filename
+    english_fname_signals = ['en_', '_en.', 'english', 'openweb', 'wiki_en',
+                             'fineweb_edu', 'gutenberg', 'wikibooks', 'bookcorpus']
+    if any(s in fname for s in english_fname_signals):
+        return 'english', 'high'
+
+    # ── Content-based heuristics (sample first 100 lines) ──
+    try:
+        code_chars = 0
+        italian_markers = 0
+        total_lines = 0
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                if total_lines >= 100:
+                    break
+                total_lines += 1
+                try:
+                    text = json.loads(line).get('text', '')
+                except (json.JSONDecodeError, KeyError):
+                    continue
+                if not text:
+                    continue
+
+                # Code signal: high density of code characters
+                cc = sum(1 for c in text[:500] if c in '{}();=<>[]+-*/&|!#')
+                tc = len(text[:500].replace(' ', '').replace('\n', ''))
+                if tc > 0 and cc / tc > 0.12:
+                    code_chars += 1
+
+                # Italian signal
+                sample_lower = text[:500].lower()
+                it_markers = [' della ', ' delle ', ' dello ', ' degli ',
+                              ' nella ', ' questo ', ' questa ', ' sono ']
+                if any(m in sample_lower for m in it_markers):
+                    italian_markers += 1
+
+        if total_lines > 0:
+            code_ratio = code_chars / total_lines
+            italian_ratio = italian_markers / total_lines
+
+            if code_ratio > 0.5 and italian_ratio < 0.05:
+                return 'c_code' if code_ratio > 0.7 else 'other_code', 'medium'
+            if italian_ratio > 0.2:
+                return 'italian', 'medium'
+            if code_ratio < 0.1:
+                return 'english', 'medium'
+    except Exception:
+        pass
+
+    return 'english', 'low'
+
+
+def collect_files(allow_unknown=False):
+    """Find and categorize all filtered JSONL files.
+
+    Args:
+        allow_unknown: If True, uncategorized files are placed in an 'unknown'
+            bucket (ratio=0, excluded from sampling) with a detailed diagnostic
+            report including likely-category inference. If False (default),
+            raises ValueError.
+    """
     files = glob.glob("data_filtered/*_filtered.jsonl")
     if not files:
         # Also check data_raw for direct JSONL files (if filter was skipped)
@@ -230,46 +366,149 @@ def collect_files():
             uncategorized.append(f)
 
     if uncategorized:
-        print(f"\nWARNING: {len(uncategorized)} uncategorized files:")
+        # ── Build diagnostic report for each uncategorized file ──
+        print(f"\n{'!'*60}")
+        print(f"ERROR: {len(uncategorized)} uncategorized file(s) found")
+        print(f"{'!'*60}")
+        print()
+        print("  These files cannot be assigned to any known category.")
+        print("  Assigning them to 'english' would silently pollute the corpus:")
+        print("    - Token balance corruption (English ratio inflates)")
+        print("    - Tokenizer training distribution skews")
+        print("    - Code specialization weakens")
+        print()
+        print("  DIAGNOSTIC REPORT:")
+        print(f"  {'─'*54}")
+
+        total_unknown_chars = 0
         for f in uncategorized:
-            print(f"  {f}")
-        print(f"  These will be assigned to 'english' as default.")
-        print(f"  If this is wrong, add patterns to CATEGORY_PATTERNS in mix.py")
-        cat_files['english'].extend(uncategorized)
+            fname = os.path.basename(f)
+            # Estimate size
+            docs = 0
+            chars = 0
+            try:
+                with open(f, 'r', encoding='utf-8', errors='ignore') as fh:
+                    for i, line in enumerate(fh):
+                        if i >= 1000:
+                            break
+                        try:
+                            text = json.loads(line).get('text', '')
+                            chars += len(text)
+                            docs += 1
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+                # Extrapolate from sample
+                total_docs = cached_count_lines(f)
+                avg_chars = chars / max(docs, 1)
+                est_total_chars = avg_chars * total_docs
+                est_tokens = est_total_chars / 4.0  # rough estimate
+            except Exception:
+                est_total_chars = 0
+                est_tokens = 0
+                total_docs = 0
+
+            total_unknown_chars += est_total_chars
+
+            # Infer likely category
+            likely_cat, confidence = _infer_likely_category(f)
+
+            print(f"  File: {fname}")
+            print(f"    Docs:         ~{total_docs:,}")
+            print(f"    Est. chars:   ~{est_total_chars/1e6:.1f}M")
+            print(f"    Est. tokens:  ~{est_tokens/1e6:.1f}M")
+            print(f"    Likely cat:   {likely_cat} (confidence: {confidence})")
+            print()
+
+        print(f"  Total unknown tokens: ~{total_unknown_chars/4e6:.1f}M")
+        print(f"  {'─'*54}")
+        print()
+        print("  FIX: Add matching patterns to CATEGORY_PATTERNS in mix.py:")
+        for cat, patterns in CATEGORY_PATTERNS.items():
+            print(f"    {cat:12s}: {patterns}")
+        print()
+
+        if allow_unknown:
+            # Place in 'unknown' bucket — NOT english
+            # This bucket has ratio=0 so it is EXCLUDED from sampling
+            # but remains visible in reports for auditing
+            cat_files['unknown'].extend(uncategorized)
+            print(f"  --allow-unknown: placed {len(uncategorized)} file(s) in 'unknown' bucket.")
+            print(f"  These files are EXCLUDED from the training mix (ratio=0%).")
+            print(f"  To include them, add the right pattern to CATEGORY_PATTERNS.")
+            print()
+        else:
+            print("  Re-run with --allow-unknown to place them in an 'unknown' bucket")
+            print("  (excluded from training) instead of erroring.")
+            print()
+            raise ValueError(
+                f"{len(uncategorized)} uncategorized file(s). "
+                f"Add patterns to CATEGORY_PATTERNS or use --allow-unknown to proceed."
+            )
 
     return cat_files
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Mix data sources by token count")
+    parser.add_argument("--allow-unknown", action="store_true",
+                        help="Place uncategorized files in an 'unknown' bucket (excluded "
+                             "from training, ratio=0%) instead of erroring. "
+                             "Unknown files are reported with diagnostics but never sampled.")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="Number of parallel workers for file scanning (default: CPU count)")
+    args = parser.parse_args()
+
+    workers = args.workers or os.cpu_count() or 4
+
+    t_start = time.time()
     print("=" * 60)
-    print("Mixing data sources by TOKEN count (char proxy)")
+    print(f"Mixing data sources by TOKEN count (char proxy, {workers} workers)")
     print("=" * 60)
 
-    cat_files = collect_files()
+    cat_files = collect_files(allow_unknown=args.allow_unknown)
+
+    # ── Parallel scan: line counts + char estimates for all files at once ──
+    all_paths = []
+    for paths in cat_files.values():
+        all_paths.extend(paths)
+
+    print(f"\nScanning {len(all_paths)} files in parallel ({workers} workers)...")
+    t_scan = time.time()
+    scan_results = parallel_scan_files(all_paths, workers=workers)
+    print(f"  Scanned in {time.time()-t_scan:.1f}s")
 
     # Calibrate chars/token per category
     cat_chars_per_token = {}
     for cat in cat_files:
-        # Use the first file in the category for calibration
         cal_path = cat_files[cat][0]
         cat_chars_per_token[cat] = calibrate_chars_per_token(cal_path)
         print(f"  {cat:12s}: chars/token = {cat_chars_per_token[cat]:.2f}")
 
-    # Show available data per category (both docs and estimated chars)
+    # Show available data per category using pre-scanned data
     print("\nAvailable data:")
     total_available_chars = 0
     for cat, paths in sorted(cat_files.items()):
-        docs = sum(cached_count_lines(p) for p in paths)
-        # Estimate total chars
+        docs = 0
         total_chars = 0
         for p in paths:
-            avg, _ = estimate_chars(p)
-            total_chars += avg * cached_count_lines(p)
+            if p in scan_results:
+                lc, avg, est = scan_results[p]
+                docs += lc
+                total_chars += est
+            else:
+                # Fallback for uncached paths
+                lc = cached_count_lines(p)
+                avg, _ = estimate_chars(p)
+                total_chars += avg * lc
+                docs += lc
         total_available_chars += total_chars
         target_pct = RATIOS.get(cat, 0) * 100
         cpt = cat_chars_per_token.get(cat, 4.0)
         est_tokens = total_chars / cpt
-        print(f"  {cat:12s}: {docs:>10,} docs, ~{total_chars/1e6:.1f}M chars (~{est_tokens/1e6:.1f}M tokens) [target: {target_pct:.0f}%] chars/tok={cpt:.2f}")
+        if cat == 'unknown':
+            print(f"  {cat:12s}: {docs:>10,} docs, ~{total_chars/1e6:.1f}M chars (~{est_tokens/1e6:.1f}M tokens) [EXCLUDED — ratio=0%] chars/tok={cpt:.2f}")
+        else:
+            print(f"  {cat:12s}: {docs:>10,} docs, ~{total_chars/1e6:.1f}M chars (~{est_tokens/1e6:.1f}M tokens) [target: {target_pct:.0f}%] chars/tok={cpt:.2f}")
 
     # Warn about missing categories
     for cat in RATIOS:
@@ -283,6 +522,7 @@ def main():
                 print(f"     FIX: python download.py --sources cpp_code --tier max")
 
     # Sample from each category according to TOKEN (char) ratios
+    # Use pre-scanned data for reservoir sampling budgets
     all_lines = []
     actual_chars = {}
 
@@ -291,16 +531,17 @@ def main():
             print(f"  WARNING: No files for category '{cat}'")
             continue
 
-        # Calculate char budget for this category
         char_budget = int(TARGET_TOTAL_CHARS * RATIOS.get(cat, 0))
 
-        # Check available chars
+        # Use pre-scanned data for available chars
         available_chars = 0
         for p in paths:
-            avg, _ = estimate_chars(p)
-            available_chars += avg * cached_count_lines(p)
+            if p in scan_results:
+                available_chars += scan_results[p][2]  # est_total_chars
+            else:
+                avg, _ = estimate_chars(p)
+                available_chars += avg * cached_count_lines(p)
 
-        # Don't try to sample more than available
         char_budget = min(char_budget, int(available_chars))
 
         if char_budget == 0:
@@ -334,7 +575,6 @@ def main():
     random.shuffle(all_lines)
 
     # Split: ~1% validation using systematic sampling
-    # This ensures val covers the full length/distribution spectrum
     val_interval = 100
     val_indices = set(range(0, len(all_lines), val_interval))
     val_lines = [all_lines[i] for i in val_indices]
@@ -355,6 +595,7 @@ def main():
         total_est_tokens += chars / cpt
 
     # Summary
+    elapsed = time.time() - t_start
     print(f"\n{'='*60}")
     print(f"Mix complete!")
     print(f"  Total documents: {len(all_lines):,}")
@@ -362,6 +603,7 @@ def main():
     print(f"  Estimated tokens: ~{total_est_tokens/1e6:.1f}M (calibrated)")
     print(f"  Train: {len(train_lines):,}")
     print(f"  Val:   {len(val_lines):,} (systematic sampling, every {val_interval}th doc)")
+    print(f"  Wall time: {elapsed:.1f}s")
     print(f"{'='*60}")
 
 

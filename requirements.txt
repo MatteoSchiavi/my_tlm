@@ -1,22 +1,25 @@
-# Core — PyTorch with CUDA (install separately, see README)
-# pip install torch --index-url https://download.pytorch.org/whl/cu121
+# ═══════════════════════════════════════════════════════════════
+# My_SLM v4.0 — Requirements
+# ═══════════════════════════════════════════════════════════════
+#
+# Install PyTorch FIRST (the default pip gives CPU-only!):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Then:
+#   pip install -r requirements.txt
+#
+# ═══════════════════════════════════════════════════════════════
 
-# Data pipeline
-datasets>=2.14.0
-huggingface-hub>=0.19.0
-tokenizers>=0.15.0
-numpy>=1.24.0
+# ─── Core (required) ─────────────────────────────────────────
+torch>=2.1.0              # MUST install with CUDA: --index-url https://download.pytorch.org/whl/cu121
+numpy>=1.24
+tokenizers>=0.15
+datasets>=2.14
+huggingface-hub>=0.19
 
-# Data quality filtering
-langdetect>=1.0.9
+# ─── Data Quality (required) ─────────────────────────────────
+langdetect>=1.0.9         # Language detection for Italian/English filtering
+datasketch>=1.6           # MinHash LSH fuzzy deduplication (v4.0)
 
-# Training monitoring (optional)
-wandb>=0.16.0
-psutil>=5.9.0
-
-# Optimizer alternatives (optional)
-bitsandbytes>=0.41.0        # 8-bit AdamW — saves ~1.3GB VRAM
-muon-pytorch>=0.1.0         # Muon optimizer — alternative to AdamW
-
-# Linux only (optional — enables torch.compile for ~20% speedup)
-# triton>=2.1.0
+# ─── Optional: Experiment Tracking ───────────────────────────
+wandb>=0.16             # Weights & Biases logging (enable: WANDB=1 python train.py)
+psutil>=5.9             # System metrics for WandB
