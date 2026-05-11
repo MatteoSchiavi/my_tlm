@@ -11,4 +11,8 @@ old_checkpoints/
 .env
 .env
 data_raw/
-
+data_mixed/
+data_filtered/
+data/
+checkpoints/
+tokenizer.json
