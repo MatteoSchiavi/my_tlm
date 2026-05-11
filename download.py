@@ -1,19 +1,27 @@
 """
-download.py v3.5 - Download training data with tiered levels and Italian + C focus.
+download.py v4.0 - Download training data with tiered levels and Italian + C focus.
 
 Tier system (use --tier flag):
   smoke    - ~30k docs total, ~5 min   (pipeline testing only)
   quick    - ~300k docs total, ~30 min  (first real training)
   standard - ~1.5M docs total, ~4 hrs   (production quality)
   full     - ~3.3M docs total, ~10 hrs  (near Chinchilla-optimal)
-  max      - ~7.5M docs total, ~28 hrs  (maximum intelligence)
+  max      - ~12M docs total, ~40 hrs  (maximum intelligence, filtering-aware)
 
 Data mix is optimised for Italian language + C programming:
   - Italian: mc4 Italian + Italian Wikipedia + Italian FineWeb
   - C Code:  StarCoderData (gated) + The-Stack-dedup (gated) + GitHub-Code (open)
   - C++ Code: StarCoderData (gated) + GitHub-Code (open)
-  - Other Code: CodeSearchNet (Python, JS) + GitHub-Code (Rust)
+  - Other Code: GitHub-Code (Python, JS, Rust — FILE-level) + CodeSearchNet (fallback)
   - English: OpenWebText + English Wikipedia + FineWeb-Edu
+
+Key fixes in v3.6:
+  + FIXED: Other code was using CodeSearchNet as PRIMARY source, which only provides
+    individual function snippets (~870 chars avg). Now uses codeparrot/github-code
+    as PRIMARY (full source files, ~8000+ chars avg = ~10x more tokens per doc).
+    CodeSearchNet moved to FALLBACK. This increases the total training budget
+    from ~900M to ~2.25B tokens (2.5x improvement).
+  + ADDED: Auto-generated file filtering for other_code (same as C/C++ downloads)
 
 Key fixes in v3.5:
   + FIXED: C code download was completely broken (got 0.8% of target)
@@ -100,15 +108,22 @@ TIERS = {
         'other_code':         150_000,
     },
     'max': {
-        'italian_oscar':      1_000_000,
-        'italian_wiki':       60_000,
-        'italian_fineweb':    600_000,
-        'english_web':        1_200_000,  # Moderate — English not primary goal
-        'english_wiki':       400_000,
-        'english_edu':        800_000,
-        'c_code':             800_000,    # BOOSTED — primary skill
-        'cpp_code':           300_000,    # NEW — shares syntax with C
-        'other_code':         300_000,    # Python, JS, Rust — general code
+        # ── v4.0: BOOSTED to account for ~40% filtering loss ──────────────────
+        # The filter.py pipeline rejects ~30-50% of raw documents (quality filters,
+        # dedup, length filters, etc.). To ensure we have enough POST-FILTER data
+        # for 5.24B training tokens (Chinchilla-optimal for 220M params), we need
+        # ~12M raw docs → ~7-8M post-filter → ~5-6B tokens.
+        # Per-category targets are scaled to maintain the intended token ratios
+        # AFTER filtering (which affects Italian text more than code).
+        'italian_oscar':      1_800_000,  # Was 1M; Italian text has ~50% filter rate
+        'italian_wiki':       80_000,     # Was 60k; Wikipedia is high-quality but short docs
+        'italian_fineweb':    900_000,    # Was 600k; FineWeb-2 is best Italian source
+        'english_web':        1_500_000,  # Was 1.2M; ~30% filter rate
+        'english_wiki':       500_000,    # Was 400k; English not primary but needed
+        'english_edu':        1_200_000,  # Was 800k; FineWeb-Edu is high value
+        'c_code':             1_500_000,  # Was 800k; C is PRIMARY skill — over-download
+        'cpp_code':           500_000,    # Was 300k; C++ shares syntax with C
+        'other_code':         500_000,    # Was 300k; Python/JS/Rust generalization
     },
 }
 
@@ -921,19 +936,25 @@ def download_cpp_code(limit):
 
 def download_other_code(limit):
     """Multi-language code (Python, JavaScript, Rust).
-    Tries truly open-access sources first, then gated ones.
+    Now uses FILE-level sources as PRIMARY (github-code, starcoderdata).
+    CodeSearchNet is FALLBACK only — it has function-level snippets (~870 chars avg)
+    which give ~10x fewer tokens per doc than file-level sources (~8000+ chars).
 
-    Sources:
-    - code_search_net: Python, JavaScript (OPEN, curated)
-    - codeparrot/github-code: Rust (OPEN)
-    - bigcode/starcoderdata: all languages (GATED, fallback)
+    Source priority per language (tries each in order until limit is met):
+      1. codeparrot/github-code — OPEN, full FILE-level code (~8k+ chars avg)
+      2. bigcode/starcoderdata — GATED, full FILE-level code (fallback)
+      3. code_search_net      — OPEN, FUNCTION-level only (~870 chars avg, last resort)
+
+    v3.6 FIX: Previously CodeSearchNet was PRIMARY for Python/JS, resulting in
+    197K docs with only 45M tokens (870 chars/doc). With github-code as PRIMARY,
+    same 200K docs should yield ~400M+ tokens (8000+ chars/doc).
     """
     out_path = os.path.join(DIRS['other_code'], 'multi_code.jsonl')
     if already_downloaded(out_path, limit):
         print(f"[OTHER-CODE] Already downloaded, skipping")
         return
 
-    print(f"[OTHER-CODE] Starting ({limit:,} docs)...")
+    print(f"[OTHER-CODE] Starting ({limit:,} docs, FILE-level priority)...")
     count = 0
     per_lang = limit // 3
 
@@ -947,11 +968,89 @@ def download_other_code(limit):
         for lang_key, lang_name in languages:
             lang_count = 0
 
-            # Source 1: CodeSearchNet (OPEN, curated — Python & JavaScript only)
-            if lang_key in ('python', 'javascript'):
+            # Source 1: codeparrot/github-code (OPEN — full FILE-level code)
+            # This is the PRIMARY source: complete source files, not just functions.
+            # CodeSearchNet only has function-level snippets (~870 chars avg),
+            # while github-code has full files (~8000+ chars avg) = ~10x more tokens.
+            try:
+                from datasets import load_dataset
+                print(f"  [OTHER-CODE/{lang_name}] Trying github-code (full files)...")
+                gh_lang = lang_name  # "Python", "JavaScript", "Rust"
+                ds = load_dataset("codeparrot/github-code", streaming=True, split="train",
+                                 languages=[gh_lang], trust_remote_code=True)
+                for ex in ds:
+                    text = ex.get('code', ex.get('content', ex.get('text', '')))
+                    if text and len(text) > 50:
+                        # Filter out auto-generated files (same as C/C++ downloads)
+                        first_line = text.split('\n')[0] if text else ''
+                        if any(skip in first_line.lower() for skip in
+                               ['auto-generated', 'generated by', 'do not edit',
+                                'automatically generated']):
+                            continue
+                        f.write(json.dumps({'text': text}, ensure_ascii=False) + '\n')
+                        lang_count += 1
+                        count += 1
+                    if lang_count >= per_lang:
+                        break
+                    _progress_log(f'OTHER-CODE/{lang_name}/GitHub', lang_count, 10000)
+            except Exception as e:
+                print(f"  [OTHER-CODE/{lang_name}/GitHub] Failed: {e}")
+                # Try with config name instead of languages parameter
                 try:
                     from datasets import load_dataset
-                    print(f"  [OTHER-CODE/{lang_name}] Trying code_search_net...")
+                    print(f"  [OTHER-CODE/{lang_name}] Trying github-code config mode...")
+                    ds = load_dataset("codeparrot/github-code", gh_lang,
+                                     split="train", streaming=True)
+                    for ex in ds:
+                        text = ex.get('code', ex.get('content', ex.get('text', '')))
+                        if text and len(text) > 50:
+                            first_line = text.split('\n')[0] if text else ''
+                            if any(skip in first_line.lower() for skip in
+                                   ['auto-generated', 'generated by', 'do not edit']):
+                                continue
+                            f.write(json.dumps({'text': text}, ensure_ascii=False) + '\n')
+                            lang_count += 1
+                            count += 1
+                        if lang_count >= per_lang:
+                            break
+                        _progress_log(f'OTHER-CODE/{lang_name}/GitHub2', lang_count, 10000)
+                except Exception as e2:
+                    print(f"  [OTHER-CODE/{lang_name}/GitHub2] Also failed: {e2}")
+
+            # Source 2: bigcode/starcoderdata (GATED — full FILE-level code)
+            if lang_count < per_lang:
+                try:
+                    from datasets import load_dataset
+                    print(f"  [OTHER-CODE/{lang_name}] Trying starcoderdata (gated, full files)...")
+                    ds = load_dataset("bigcode/starcoderdata", lang_key,
+                                     split="train", streaming=True)
+                    for ex in ds:
+                        text = ex.get('content', ex.get('code', ex.get('text', '')))
+                        if text and len(text) > 50:
+                            first_line = text.split('\n')[0] if text else ''
+                            if any(skip in first_line.lower() for skip in
+                                   ['auto-generated', 'generated by', 'do not edit']):
+                                continue
+                            f.write(json.dumps({'text': text}, ensure_ascii=False) + '\n')
+                            lang_count += 1
+                            count += 1
+                        if lang_count >= per_lang:
+                            break
+                        _progress_log(f'OTHER-CODE/{lang_name}/StarCoder', lang_count, 10000)
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    if 'gated' in err_msg or 'access' in err_msg:
+                        print(f"  [OTHER-CODE/{lang_name}/StarCoder] GATED — needs HF auth")
+                    else:
+                        print(f"  [OTHER-CODE/{lang_name}/StarCoder] Failed: {e}")
+
+            # Source 3: CodeSearchNet (OPEN — FUNCTION-level only, Python & JavaScript)
+            # FALLBACK: these are individual functions, not full files.
+            # Much shorter (~870 chars avg) but better than nothing.
+            if lang_count < per_lang and lang_key in ('python', 'javascript'):
+                try:
+                    from datasets import load_dataset
+                    print(f"  [OTHER-CODE/{lang_name}] Trying code_search_net (function-level fallback)...")
                     ds = load_dataset("code_search_net", lang_key,
                                      split="train", streaming=True)
                     for ex in ds:
@@ -966,62 +1065,6 @@ def download_other_code(limit):
                         _progress_log(f'OTHER-CODE/{lang_name}/CSN', lang_count, 10000)
                 except Exception as e:
                     print(f"  [OTHER-CODE/{lang_name}/CSN] Failed: {e}")
-
-            # Source 2: codeparrot/github-code (OPEN — for Rust and overflow)
-            if lang_count < per_lang:
-                try:
-                    from datasets import load_dataset
-                    print(f"  [OTHER-CODE/{lang_name}] Trying github-code (OPEN)...")
-                    # Map lang_key to github-code language name
-                    gh_lang = lang_name  # "Python", "JavaScript", "Rust"
-                    ds = load_dataset("codeparrot/github-code", streaming=True, split="train",
-                                     languages=[gh_lang], trust_remote_code=True)
-                    for ex in ds:
-                        text = ex.get('code', ex.get('content', ex.get('text', '')))
-                        if text and len(text) > 50:
-                            f.write(json.dumps({'text': text}, ensure_ascii=False) + '\n')
-                            lang_count += 1
-                            count += 1
-                        if lang_count >= per_lang:
-                            break
-                        _progress_log(f'OTHER-CODE/{lang_name}/GitHub', lang_count, 10000)
-                except Exception as e:
-                    print(f"  [OTHER-CODE/{lang_name}/GitHub] Failed: {e}")
-                    # Try with config name
-                    try:
-                        from datasets import load_dataset
-                        ds = load_dataset("codeparrot/github-code", gh_lang,
-                                         split="train", streaming=True)
-                        for ex in ds:
-                            text = ex.get('code', ex.get('content', ex.get('text', '')))
-                            if text and len(text) > 50:
-                                f.write(json.dumps({'text': text}, ensure_ascii=False) + '\n')
-                                lang_count += 1
-                                count += 1
-                            if lang_count >= per_lang:
-                                break
-                            _progress_log(f'OTHER-CODE/{lang_name}/GitHub2', lang_count, 10000)
-                    except Exception as e2:
-                        print(f"  [OTHER-CODE/{lang_name}/GitHub2] Also failed: {e2}")
-
-            # Source 3: bigcode/starcoderdata (GATED — fallback)
-            if lang_count < per_lang:
-                try:
-                    from datasets import load_dataset
-                    print(f"  [OTHER-CODE/{lang_name}] Trying starcoderdata (gated)...")
-                    ds = load_dataset("bigcode/starcoderdata", lang_key,
-                                     split="train", streaming=True)
-                    for ex in ds:
-                        text = ex.get('content', ex.get('code', ex.get('text', '')))
-                        if text and len(text) > 50:
-                            f.write(json.dumps({'text': text}, ensure_ascii=False) + '\n')
-                            lang_count += 1
-                            count += 1
-                        if lang_count >= per_lang:
-                            break
-                        _progress_log(f'OTHER-CODE/{lang_name}/StarCoder', lang_count, 10000)
-                except Exception as e:
-                    print(f"  [OTHER-CODE/{lang_name}/StarCoder] Failed (gated): {e}")
 
             print(f"  [OTHER-CODE] {lang_name}: {lang_count:,} files")
 
